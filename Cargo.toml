@@ -1,0 +1,23 @@
+[package]
+name = "sshenanigans"
+version = "0.1.0"
+edition = "2021"
+authors = ["Samuel Ainsworth <skainsworth@gmail.com>"]
+default-run = "sshenanigans"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "*"
+async-trait = "*"
+clap = { version = "*", features = ["derive"] }
+env_logger = "*"
+log = "*"
+# See https://github.com/doy/pty-process/pull/8#issuecomment-1829236622.
+pty-process = { git = "https://github.com/mobusoperandi/pty-process.git", rev = "78896303a47c370e6cd5527267d8db696ffc62f1", features = ["async"] }
+russh = "*"
+russh-keys = "*"
+serde = "*"
+serde_json = "*"
+tokio = { version = "*" }
+uuid = { version = "*", features = ["v4"] }
