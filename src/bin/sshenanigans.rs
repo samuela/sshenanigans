@@ -5,7 +5,7 @@ use russh::server::{Auth, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec, MethodSet};
 use russh_keys::PublicKeyBase64;
 use serde::de::DeserializeOwned;
-use sshenanigans::{AuthRequestMethod, AuthResponse, ExecResponse, ExecResponseAccept, Request};
+use sshenanigans::{AuthRequestMethod, AuthResponse, ExecResponse, ExecResponseAccept, Request, RequestType};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
@@ -19,19 +19,30 @@ struct Server {
 
 type ChannelValue<T> = Arc<Mutex<HashMap<ChannelId, T>>>;
 
+/// The requested PTY size (col, row), PTS, and writer to the PTY.
+struct PtyStuff {
+  requested_col_width: u16,
+  requested_row_height: u16,
+  pts: pty_process::Pts,
+  pty_writer: OwnedWritePty,
+}
+
 struct ServerHandler {
   gatekeeper_command: String,
+
+  /// A random UUID assigned to each client.
   client_id: Uuid,
+
+  /// The IP address of the client.
   client_address: std::net::SocketAddr,
 
   /// The SSH protocol associates each channel with a user. This value will only be `Some` after a successful
   /// authentication.
   authed_username: Option<String>,
 
-  // NOTE: Perhaps worth considering a single HashMap that maps channel_id to a struct containing all of the below?
-  pty_requested_sizes: ChannelValue<(u32, u32)>,
-  pty_pts: ChannelValue<pty_process::Pts>,
-  pty_writers: ChannelValue<OwnedWritePty>,
+  ptys: ChannelValue<PtyStuff>,
+
+  /// Writer to the stdin of the child process associated with a channel.
   stdin_writers: ChannelValue<tokio::process::ChildStdin>,
 }
 
@@ -47,9 +58,7 @@ impl russh::server::Server for Server {
       client_id,
       client_address,
       authed_username: None,
-      pty_requested_sizes: Arc::new(Mutex::new(HashMap::new())),
-      pty_pts: Arc::new(Mutex::new(HashMap::new())),
-      pty_writers: Arc::new(Mutex::new(HashMap::new())),
+      ptys: Arc::new(Mutex::new(HashMap::new())),
       stdin_writers: Arc::new(Mutex::new(HashMap::new())),
     }
   }
@@ -78,7 +87,7 @@ impl russh::server::Server for Server {
 /// in the flow.
 impl ServerHandler {
   /// Talk to the gatekeeper and parse its response.
-  fn call_gatekeeper<O: DeserializeOwned>(&self, request: &Request) -> O {
+  fn gatekeeper_call<O: DeserializeOwned>(&self, request: &Request) -> O {
     let start_time = std::time::Instant::now();
     let mut child = std::process::Command::new(&self.gatekeeper_command)
       .stdin(std::process::Stdio::piped())
@@ -129,15 +138,18 @@ impl ServerHandler {
     serde_json::from_slice(&output.stdout).expect("Failed to parse gatekeeper stdout")
   }
 
-  fn handle_auth_request(
+  /// Send an auth request to the gatekeeper and parse its response.
+  fn gatekeeper_make_auth_request(
     self,
     username: &str,
     payload: AuthRequestMethod,
   ) -> Result<(ServerHandler, Auth), <Self as russh::server::Handler>::Error> {
-    let response: AuthResponse = self.call_gatekeeper(&Request::Auth {
+    let response: AuthResponse = self.gatekeeper_call(&Request {
       client_address: self.client_address.to_string(),
-      username: username.to_owned(),
-      method: payload,
+      request: RequestType::Auth {
+        username: username.to_owned(),
+        method: payload,
+      },
     });
 
     Ok(match response {
@@ -185,17 +197,64 @@ impl ServerHandler {
     })
   }
 
+  async fn gatekeeper_handle_exec_response(
+    &self,
+    channel_id: ChannelId,
+    session: &mut Session,
+    response: ExecResponse,
+  ) {
+    match response.accept {
+      Some(ExecResponseAccept {
+        command,
+        arguments,
+        working_directory,
+        uid,
+        gid,
+      }) => {
+        log::debug!("gatekeeper returned ExecResponse::Accept");
+
+        let handle = session.handle();
+        match self.ptys.lock().await.get(&channel_id) {
+          Some(pty_stuff) => {
+            self
+              .pty_exec(
+                channel_id,
+                handle,
+                pty_stuff,
+                &command,
+                arguments,
+                &working_directory,
+                uid,
+                gid,
+              )
+              .await
+          }
+          None => {
+            self
+              .non_pty_exec(channel_id, handle, &command, arguments, &working_directory, uid, gid)
+              .await
+          }
+        }
+      }
+      None => {
+        log::debug!("gatekeeper returned ExecResponse::Reject");
+        session.eof(channel_id);
+        session.close(channel_id);
+      }
+    }
+  }
+
   /// Execute a command in a given PTY. Upon exit, close the SSH channel.
   async fn pty_exec(
     &self,
+    channel_id: ChannelId,
+    handle: russh::server::Handle,
+    pty_stuff: &PtyStuff,
     command: &str,
     arguments: Vec<String>,
     working_directory: &str,
     uid: u32,
     gid: u32,
-    channel_id: ChannelId,
-    handle: russh::server::Handle,
-    pts: pty_process::Pts,
   ) {
     // Spawn a new process in pty
     let mut child = pty_process::Command::new(command)
@@ -203,7 +262,7 @@ impl ServerHandler {
           .current_dir(working_directory)
           .uid(uid)
           .gid(gid)
-          .spawn(&pts)
+          .spawn(&pty_stuff.pts)
           .expect("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.");
     log::info!(
       "[{} {} {}] child spawned with pid: {}",
@@ -217,8 +276,7 @@ impl ServerHandler {
     // to do it here.
 
     // Close the channel when child exits
-    let channel_pty_writers_ = Arc::clone(&self.pty_writers);
-    let pty_requested_sizes_ = Arc::clone(&self.pty_requested_sizes);
+    let ptys_ = Arc::clone(&self.ptys);
     tokio::spawn(async move {
       let status = child.wait().await.unwrap().code().unwrap();
       // The `.try_into().unwrap_or(1)` is necessary since `status` is an i32, but `exit_status_request` expects a u32.
@@ -230,26 +288,18 @@ impl ServerHandler {
       handle.close(channel_id).await.unwrap();
 
       // Clean up things from our `pty_writers` and `pty_requested_sizes` `HashMap`s
-      channel_pty_writers_.lock().await.remove(&channel_id);
-      pty_requested_sizes_.lock().await.remove(&channel_id);
+      ptys_.lock().await.remove(&channel_id);
     });
 
     // Resize the PTY according to the requested size. We don't do this at PTY creation time since we can't resize until
     // after the child is spawned on macOS. See https://github.com/doy/pty-process/issues/7#issuecomment-1826196215 and
     // https://github.com/pkgw/stund/issues/305.
-    let pty_requested_sizes = self.pty_requested_sizes.lock().await;
-    let (col_width, row_height) = pty_requested_sizes
-      .get(&channel_id)
-      // TODO: is there a cleaner way to refactor this? Pair pts with requested sizes?
-      .expect("pty_requested_sizes doesn't contain channel_id, but it should have been set in pty_request");
-    if let Err(e) = self
-      .pty_writers
-      .lock()
-      .await
-      .get(&channel_id)
-      .unwrap()
-      .resize(pty_process::Size::new(*row_height as u16, *col_width as u16))
-    {
+
+    // NOTE: pty_process::Size::new flips the order of col_width and row_height!
+    if let Err(e) = pty_stuff.pty_writer.resize(pty_process::Size::new(
+      pty_stuff.requested_row_height,
+      pty_stuff.requested_col_width,
+    )) {
       log::error!("pty.resize failed: {:?}", e);
     }
   }
@@ -257,13 +307,13 @@ impl ServerHandler {
   /// Execute a command without a PTY.
   async fn non_pty_exec(
     &self,
+    channel_id: ChannelId,
+    handle: russh::server::Handle,
     command: &str,
     arguments: Vec<String>,
     working_directory: &str,
     uid: u32,
     gid: u32,
-    channel_id: ChannelId,
-    handle: russh::server::Handle,
   ) {
     // Spawn a new process in pty
     let mut child = tokio::process::Command::new(command)
@@ -329,51 +379,6 @@ impl ServerHandler {
       handle.close(channel_id).await.unwrap();
     });
   }
-
-  async fn handle_exec_response(&self, channel_id: ChannelId, session: &mut Session, response: ExecResponse) {
-    match response.accept {
-      Some(ExecResponseAccept {
-        command,
-        arguments,
-        working_directory,
-        uid,
-        gid,
-      }) => {
-        log::debug!("gatekeeper returned ExecResponse::Accept");
-
-        match self.pty_pts.lock().await.remove(&channel_id) {
-          Some(pts) => {
-            log::debug!("found pts for channel_id: {channel_id}");
-            let handle = session.handle();
-            self
-              .pty_exec(
-                &command,
-                arguments,
-                &working_directory,
-                uid,
-                gid,
-                channel_id,
-                handle,
-                pts,
-              )
-              .await
-          }
-          None => {
-            log::debug!("no pts for channel_id: {channel_id}, proceeding with non-PTY execution",);
-            let handle = session.handle();
-            self
-              .non_pty_exec(&command, arguments, &working_directory, uid, gid, channel_id, handle)
-              .await;
-          }
-        }
-      }
-      None => {
-        log::debug!("gatekeeper returned ExecResponse::Reject");
-        session.eof(channel_id);
-        session.close(channel_id);
-      }
-    }
-  }
 }
 
 #[async_trait]
@@ -386,7 +391,7 @@ impl russh::server::Handler for ServerHandler {
       self.client_address,
       self.client_id
     );
-    self.handle_auth_request(username, AuthRequestMethod::None)
+    self.gatekeeper_make_auth_request(username, AuthRequestMethod::None)
   }
 
   async fn auth_password(self, username: &str, password: &str) -> Result<(Self, Auth), Self::Error> {
@@ -395,7 +400,7 @@ impl russh::server::Handler for ServerHandler {
       self.client_address,
       self.client_id
     );
-    self.handle_auth_request(
+    self.gatekeeper_make_auth_request(
       username,
       AuthRequestMethod::Password {
         password: password.to_string(),
@@ -411,7 +416,7 @@ impl russh::server::Handler for ServerHandler {
     let public_key_algorithm = public_key.name();
     let public_key_base64 = public_key.public_key_base64();
     log::info!("[{} {}] auth_publickey: username: {username} public_key_algorithm: {public_key_algorithm} public_key_base64: {public_key_base64}", self.client_address, self.client_id);
-    self.handle_auth_request(
+    self.gatekeeper_make_auth_request(
       username,
       AuthRequestMethod::PublicKey {
         public_key_algorithm: public_key_algorithm.to_string(),
@@ -420,7 +425,7 @@ impl russh::server::Handler for ServerHandler {
     )
   }
 
-  // Not a lot of logic here, but this handler is necessary.
+  // Not a lot of logic here, but russh requires this handler.
   async fn channel_open_session(
     self,
     channel: Channel<Msg>,
@@ -450,20 +455,25 @@ impl russh::server::Handler for ServerHandler {
 
     // TODO: We're currently ignoring the requested modes. We should probably do something with them.
 
-    // We save these values so we can resize the pty later in shell_request. Most clients seem to send a pty_request
-    // before a shell_request.
-    {
-      let mut pty_requested_sizes = self.pty_requested_sizes.lock().await;
-      pty_requested_sizes.insert(channel_id, (col_width, row_height));
-    }
-
     let pty = pty_process::Pty::new().unwrap();
-    // NOTE: we must get the pts before `.into_split()` because it consumes the pty.
+    // NOTE: we must get `pts` before `.into_split()` because it consumes the PTY.
     let pts = pty.pts().unwrap();
-    self.pty_pts.lock().await.insert(channel_id, pts);
+
     // split pty into reader + writer
     let (mut pty_reader, pty_writer) = pty.into_split();
-    self.pty_writers.lock().await.insert(channel_id, pty_writer);
+
+    // Insert all the goodies into `self.ptys`. We save the requested terminal size so we can resize the PTY later in
+    // `shell_request`. Most clients seem to send a `pty_request` before a `shell_request`, and it's not clear that
+    // sending `pty_request` after `shell_request` is support by the SSH spec.
+    self.ptys.lock().await.insert(
+      channel_id,
+      PtyStuff {
+        requested_col_width: col_width as u16,
+        requested_row_height: row_height as u16,
+        pts,
+        pty_writer,
+      },
+    );
 
     // Read bytes from the PTY and send them to the SSH client
     let session_handle = session.handle();
@@ -491,29 +501,29 @@ impl russh::server::Handler for ServerHandler {
       channel_id
     );
 
-    let resp: ExecResponse = self.call_gatekeeper(&Request::Shell {
+    let resp: ExecResponse = self.gatekeeper_call(&Request {
       client_address: self.client_address.to_string(),
-      username: self.authed_username.clone().unwrap(),
+      request: RequestType::Shell {
+        username: self.authed_username.clone().unwrap(),
+      },
     });
-    self.handle_exec_response(channel_id, &mut session, resp).await;
+    self
+      .gatekeeper_handle_exec_response(channel_id, &mut session, resp)
+      .await;
 
     Ok((self, session))
   }
 
   /// SSH client sends data, pipe it to the corresponding PTY or stdin
   async fn data(self, channel_id: ChannelId, data: &[u8], session: Session) -> Result<(Self, Session), Self::Error> {
-    {
-      let mut pty_writers = self.pty_writers.lock().await;
-      let mut stdin_writers = self.stdin_writers.lock().await;
-      if let Some(pty_writer) = pty_writers.get_mut(&channel_id) {
-        log::debug!("pty_writer: data = {data:02x?}");
-        pty_writer.write_all(data).await.unwrap();
-      } else if let Some(stdin_writer) = stdin_writers.get_mut(&channel_id) {
-        log::debug!("stdin_writer: data = {data:02x?}");
-        stdin_writer.write_all(data).await.unwrap();
-      } else {
-        log::warn!("could not find outlet for data from {channel_id}, skipping write")
-      }
+    if let Some(PtyStuff { pty_writer, .. }) = self.ptys.lock().await.get_mut(&channel_id) {
+      log::debug!("pty_writer: data = {data:02x?}");
+      pty_writer.write_all(data).await.unwrap();
+    } else if let Some(stdin_writer) = self.stdin_writers.lock().await.get_mut(&channel_id) {
+      log::debug!("stdin_writer: data = {data:02x?}");
+      stdin_writer.write_all(data).await.unwrap();
+    } else {
+      log::warn!("could not find outlet for data from {channel_id}, skipping write")
     }
 
     Ok((self, session))
@@ -525,8 +535,7 @@ impl russh::server::Handler for ServerHandler {
     command: &[u8],
     mut session: Session,
   ) -> Result<(Self, Session), Self::Error> {
-    // TODO: we shouldn't be panic'ing as a result of user-defined inputs.
-    let command_string = String::from_utf8(command.to_vec()).expect("command is not valid UTF-8");
+    let command_string = String::from_utf8(command.to_vec())?;
     log::info!(
       "[{} {} {}] exec_request: command: {command_string}",
       self.client_address,
@@ -534,12 +543,16 @@ impl russh::server::Handler for ServerHandler {
       channel_id
     );
 
-    let resp: ExecResponse = self.call_gatekeeper(&Request::Exec {
+    let resp: ExecResponse = self.gatekeeper_call(&Request {
       client_address: self.client_address.to_string(),
-      username: self.authed_username.clone().unwrap(),
-      command: command_string.to_string(),
+      request: RequestType::Exec {
+        username: self.authed_username.clone().unwrap(),
+        command: command_string.to_string(),
+      },
     });
-    self.handle_exec_response(channel_id, &mut session, resp).await;
+    self
+      .gatekeeper_handle_exec_response(channel_id, &mut session, resp)
+      .await;
 
     Ok((self, session))
   }
@@ -555,16 +568,14 @@ impl russh::server::Handler for ServerHandler {
     session: Session,
   ) -> Result<(Self, Session), Self::Error> {
     log::info!("[{} {} {}] window_change_request col_width = {col_width} row_height = {row_height}, pix_width = {pix_width}, pix_height = {pix_height}", self.client_address, self.client_id, channel_id);
-    {
-      let mut pty_writers = self.pty_writers.lock().await;
-      if let Some(pty_writer) = pty_writers.get_mut(&channel_id) {
-        if let Err(e) = pty_writer.resize(pty_process::Size::new(row_height as u16, col_width as u16)) {
-          log::error!("pty.resize failed: {:?}", e);
-        }
-      } else {
-        log::warn!("pty_writers doesn't contain channel_id: {channel_id}, skipping pty resize")
+    if let Some(PtyStuff { pty_writer, .. }) = self.ptys.lock().await.get_mut(&channel_id) {
+      if let Err(e) = pty_writer.resize(pty_process::Size::new(row_height as u16, col_width as u16)) {
+        log::error!("pty.resize failed: {:?}", e);
       }
+    } else {
+      log::warn!("ptys doesn't contain channel_id: {channel_id}, skipping pty resize")
     }
+
     Ok((self, session))
   }
 
@@ -577,9 +588,7 @@ impl russh::server::Handler for ServerHandler {
     );
 
     // Clean up things from our `HashMap`s
-    self.pty_requested_sizes.lock().await.remove(&channel_id);
-    self.pty_pts.lock().await.remove(&channel_id);
-    self.pty_writers.lock().await.remove(&channel_id);
+    self.ptys.lock().await.remove(&channel_id);
     self.stdin_writers.lock().await.remove(&channel_id);
 
     Ok((self, session))
