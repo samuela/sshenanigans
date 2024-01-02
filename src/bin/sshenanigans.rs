@@ -8,6 +8,7 @@ use serde::de::DeserializeOwned;
 use sshenanigans::{AuthRequestMethod, AuthResponse, ExecResponse, ExecResponseAccept, Request, RequestType};
 use std::collections::HashMap;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -603,9 +604,10 @@ struct Args {
   #[arg(long)]
   host_key_path: Vec<String>,
 
-  /// Port to listen on.
-  #[arg(long, default_value_t = 22)]
-  port: u16,
+  /// Address to listen on.
+  // Supporting multiple addresses is blocked on https://github.com/warp-tech/russh/issues/223.
+  #[arg(long, default_value = "0.0.0.0:22")]
+  listen: SocketAddr,
 
   /// Path to The Gatekeeper command. Note that relative paths must start with ./ or similar.
   #[arg(long)]
@@ -643,10 +645,10 @@ async fn main() {
     keys: load_host_keys(args.host_key_path),
     ..Default::default()
   };
-  log::info!("Listening on 0.0.0.0:{}", args.port);
+  log::info!("Listening on {}", args.listen);
   russh::server::run(
     Arc::new(config),
-    ("0.0.0.0", args.port),
+    &args.listen,
     Server {
       gatekeeper_command: args.gatekeeper,
     },

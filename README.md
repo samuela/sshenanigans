@@ -120,7 +120,7 @@ And responses follow the same structure as for `Shell` requests.
 
    This will create files `hostkey` and `hostkey.pub` in your current directory. This key pair is used to identify the SSH server to clients. If you have ever seen a "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!" message, that's because the SSH server changed their host key.
 
-2. Run sshenanigans: `sshenanigans --host-key-path ./hostkey --port 2222 --gatekeeper=./examples/basic.py`
+2. Run sshenanigans: `sshenanigans --host-key-path=./hostkey --listen=0.0.0.0:2222 --gatekeeper=./examples/basic.py`
 
    This will start sshenanigans on port 2222, using the host key we generated in step 1, and using the gatekeeper script `./examples/basic.py`.
 
