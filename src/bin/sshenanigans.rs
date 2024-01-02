@@ -614,7 +614,7 @@ struct Args {
 
 fn load_host_keys(host_key_paths: Vec<String>) -> Vec<russh_keys::key::KeyPair> {
   if host_key_paths.is_empty() {
-    log::error!("At least one --host_key_path is required");
+    log::error!("At least one --host-key-path is required");
     std::process::exit(1);
   }
 
