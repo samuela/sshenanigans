@@ -607,7 +607,7 @@ struct Args {
   #[arg(long, default_value_t = 22)]
   port: u16,
 
-  /// Path to the authorization command. Note that relative paths must start with ./ or similar. See XXX for more information.
+  /// Path to The Gatekeeper command. Note that relative paths must start with ./ or similar.
   #[arg(long)]
   gatekeeper: String,
 }
