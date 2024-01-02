@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Samuel Ainsworth <skainsworth@gmail.com>"]
 default-run = "sshenanigans"
+license = "MIT"
+description = "Build your own SSH server 🛜"
+repository = "https://github.com/samuela/sshenanigans"
+readme = "README.md"
+categories = ["command-line-utilities", "network-programming"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
