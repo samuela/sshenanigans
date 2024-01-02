@@ -9,13 +9,14 @@ use sshenanigans::{AuthRequestMethod, AuthResponse, ExecResponse, ExecResponseAc
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 struct Server {
-  gatekeeper_command: String,
+  gatekeeper_command: PathBuf,
 }
 
 type ChannelValue<T> = Arc<Mutex<HashMap<ChannelId, T>>>;
@@ -29,7 +30,7 @@ struct PtyStuff {
 }
 
 struct ServerHandler {
-  gatekeeper_command: String,
+  gatekeeper_command: PathBuf,
 
   /// A random UUID assigned to each client.
   client_id: Uuid,
@@ -602,7 +603,7 @@ impl russh::server::Handler for ServerHandler {
 struct Args {
   /// Path to private key files for the host. Can be specified multiple times, and at least one is required.
   #[arg(long)]
-  host_key_path: Vec<String>,
+  host_key_path: Vec<PathBuf>,
 
   /// Address to listen on.
   // Supporting multiple addresses is blocked on https://github.com/warp-tech/russh/issues/223.
@@ -611,10 +612,10 @@ struct Args {
 
   /// Path to The Gatekeeper command. Note that relative paths must start with ./ or similar.
   #[arg(long)]
-  gatekeeper: String,
+  gatekeeper: PathBuf,
 }
 
-fn load_host_keys(host_key_paths: Vec<String>) -> Vec<russh_keys::key::KeyPair> {
+fn load_host_keys(host_key_paths: Vec<PathBuf>) -> Vec<russh_keys::key::KeyPair> {
   if host_key_paths.is_empty() {
     log::error!("At least one --host-key-path is required");
     std::process::exit(1);
@@ -625,7 +626,7 @@ fn load_host_keys(host_key_paths: Vec<String>) -> Vec<russh_keys::key::KeyPair> 
     .map(|path| {
       // NOTE: we don't support encrypted keys
       russh_keys::load_secret_key(path, None).unwrap_or_else(|err| {
-        log::error!("Failed to load host key {path}: {err:?}");
+        log::error!("Failed to load host key {}: {err:?}", path.to_string_lossy());
         std::process::exit(1);
       })
     })
