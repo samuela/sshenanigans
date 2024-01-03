@@ -69,6 +69,8 @@ Responses should either accept the reqeust or respond with a rejection and a set
 { "accept": false, "proceed_with_methods": ["PASSWORD"] }
 ```
 
+Allowed `proceed_with_methods` values are "NONE", "PASSWORD", "PUBLICKEY", "HOSTBASED", "KEYBOARD_INTERACTIVE" (case sensitive).
+
 ### `Shell` requests
 
 This request is associated with the standard invocation of `ssh user@host`. Requests look like
