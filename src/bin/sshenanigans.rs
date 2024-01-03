@@ -655,5 +655,5 @@ async fn main() {
     },
   )
   .await
-  .unwrap();
+  .expect("Failed to start SSH server. Are you sure you have permissions to bind to the given socket address?");
 }
