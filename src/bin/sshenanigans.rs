@@ -156,7 +156,7 @@ impl ServerHandler {
 
     Ok(match response {
       AuthResponse { accept: true, .. } => {
-        log::debug!(
+        log::info!(
           "[{} {}] received {{ accept: true }} from gatekeeper",
           self.client_address,
           self.client_id,
@@ -174,7 +174,7 @@ impl ServerHandler {
         proceed_with_methods,
         ..
       } => {
-        log::debug!(
+        log::info!(
           "[{} {}] received {{ accept: false, proceed_with_methods: {:?} }} from gatekeeper",
           self.client_address,
           self.client_id,
