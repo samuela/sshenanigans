@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 struct Server {
   gatekeeper_command: PathBuf,
+  gatekeeper_args: Vec<String>,
 }
 
 type ChannelValue<T> = Arc<Mutex<HashMap<ChannelId, T>>>;
@@ -31,6 +32,7 @@ struct PtyStuff {
 
 struct ServerHandler {
   gatekeeper_command: PathBuf,
+  gatekeeper_args: Vec<String>,
 
   /// A random UUID assigned to each client.
   client_id: Uuid,
@@ -57,6 +59,7 @@ impl russh::server::Server for Server {
     log::info!("[{}] new client, assigning id {client_id}", client_address);
     ServerHandler {
       gatekeeper_command: self.gatekeeper_command.clone(),
+      gatekeeper_args: self.gatekeeper_args.clone(),
       client_id,
       client_address,
       authed_username: None,
@@ -92,6 +95,7 @@ impl ServerHandler {
   fn gatekeeper_call<O: DeserializeOwned>(&self, request: &Request) -> O {
     let start_time = std::time::Instant::now();
     let mut child = std::process::Command::new(&self.gatekeeper_command)
+      .args(&self.gatekeeper_args)
       .stdin(std::process::Stdio::piped())
       .stdout(std::process::Stdio::piped())
       .spawn()
@@ -610,9 +614,9 @@ struct Args {
   #[arg(long, default_value = "0.0.0.0:22")]
   listen: SocketAddr,
 
-  /// Path to The Gatekeeper command. Note that relative paths must start with ./ or similar.
+  /// The Gatekeeper command. Note that relative paths must start with ./ or similar.
   #[arg(long)]
-  gatekeeper: PathBuf,
+  gatekeeper: String,
 }
 
 fn load_host_keys(host_key_paths: Vec<PathBuf>) -> Vec<russh_keys::key::KeyPair> {
@@ -640,6 +644,9 @@ async fn main() {
   let args = Args::parse();
   log::info!("args: {:?}", args);
 
+  let gatekeeper_split = args.gatekeeper.split_whitespace().collect::<Vec<&str>>();
+  assert!(!gatekeeper_split.is_empty(), "gatekeeper command must not be empty");
+
   let config = russh::server::Config {
     inactivity_timeout: Some(std::time::Duration::from_secs(30 * 60)),
     auth_rejection_time: std::time::Duration::from_secs(1),
@@ -651,7 +658,9 @@ async fn main() {
     Arc::new(config),
     &args.listen,
     Server {
-      gatekeeper_command: args.gatekeeper,
+      // This indexing is safe since we assert that `gatekeeper_split` is not empty above.
+      gatekeeper_command: gatekeeper_split[0].into(),
+      gatekeeper_args: gatekeeper_split[1..].iter().map(|s| s.to_string()).collect(),
     },
   )
   .await
