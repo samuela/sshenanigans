@@ -5,7 +5,9 @@ use russh::server::{Auth, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec, MethodSet};
 use russh_keys::PublicKeyBase64;
 use serde::de::DeserializeOwned;
-use sshenanigans::{AuthRequestMethod, AuthResponse, ExecResponse, ExecResponseAccept, Request, RequestType};
+use sshenanigans::{
+  AuthResponse, Credentials, CredentialsType, ExecResponse, ExecResponseAccept, Request, RequestType,
+};
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -42,7 +44,7 @@ struct ServerHandler {
 
   /// The SSH protocol associates each channel with a user. This value will only be `Some` after a successful
   /// authentication.
-  authed_username: Option<String>,
+  verified_credentials: Option<Credentials>,
 
   ptys: ChannelValue<PtyStuff>,
 
@@ -62,7 +64,7 @@ impl russh::server::Server for Server {
       gatekeeper_args: self.gatekeeper_args.clone(),
       client_id,
       client_address,
-      authed_username: None,
+      verified_credentials: None,
       ptys: Arc::new(Mutex::new(HashMap::new())),
       stdin_writers: Arc::new(Mutex::new(HashMap::new())),
     }
@@ -147,14 +149,13 @@ impl ServerHandler {
   /// Send an auth request to the gatekeeper and parse its response.
   fn gatekeeper_make_auth_request(
     self,
-    username: &str,
-    payload: AuthRequestMethod,
+    unverified_credentials: &Credentials,
   ) -> Result<(ServerHandler, Auth), <Self as russh::server::Handler>::Error> {
     let response: AuthResponse = self.gatekeeper_call(&Request {
       client_address: self.client_address.to_string(),
+      client_id: self.client_id.to_string(),
       request: RequestType::Auth {
-        username: username.to_owned(),
-        method: payload,
+        unverified_credentials: unverified_credentials.clone(),
       },
     });
 
@@ -167,7 +168,7 @@ impl ServerHandler {
         );
         (
           Self {
-            authed_username: Some(username.to_owned()),
+            verified_credentials: Some(unverified_credentials.clone()),
             ..self
           },
           russh::server::Auth::Accept,
@@ -186,7 +187,7 @@ impl ServerHandler {
         );
         (
           Self {
-            authed_username: None,
+            verified_credentials: None,
             ..self
           },
           russh::server::Auth::Reject {
@@ -210,40 +211,17 @@ impl ServerHandler {
     response: ExecResponse,
   ) {
     match response.accept {
-      Some(ExecResponseAccept {
-        command,
-        arguments,
-        working_directory,
-        uid,
-        gid,
-      }) => {
-        log::debug!("gatekeeper returned ExecResponse::Accept");
+      Some(cmd) => {
+        log::debug!("gatekeeper accepted exec request");
 
         let handle = session.handle();
         match self.ptys.lock().await.get(&channel_id) {
-          Some(pty_stuff) => {
-            self
-              .pty_exec(
-                channel_id,
-                handle,
-                pty_stuff,
-                &command,
-                arguments,
-                &working_directory,
-                uid,
-                gid,
-              )
-              .await
-          }
-          None => {
-            self
-              .non_pty_exec(channel_id, handle, &command, arguments, &working_directory, uid, gid)
-              .await
-          }
+          Some(pty_stuff) => self.pty_exec(channel_id, handle, pty_stuff, &cmd).await,
+          None => self.non_pty_exec(channel_id, handle, &cmd).await,
         }
       }
       None => {
-        log::debug!("gatekeeper returned ExecResponse::Reject");
+        log::debug!("gatekeeper rejected exec request");
         session.eof(channel_id);
         session.close(channel_id);
       }
@@ -256,18 +234,14 @@ impl ServerHandler {
     channel_id: ChannelId,
     handle: russh::server::Handle,
     pty_stuff: &PtyStuff,
-    command: &str,
-    arguments: Vec<String>,
-    working_directory: &str,
-    uid: u32,
-    gid: u32,
+    command_spec: &ExecResponseAccept,
   ) {
     // Spawn a new process in pty
-    let mut child = pty_process::Command::new(command)
-          .args(arguments)
-          .current_dir(working_directory)
-          .uid(uid)
-          .gid(gid)
+    let mut child = pty_process::Command::new(&command_spec.command)
+          .args(&command_spec.arguments)
+          .current_dir(&command_spec.working_directory)
+          .uid(command_spec.uid)
+          .gid(command_spec.gid)
           .spawn(&pty_stuff.pts)
           .expect("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.");
     log::info!(
@@ -315,18 +289,14 @@ impl ServerHandler {
     &self,
     channel_id: ChannelId,
     handle: russh::server::Handle,
-    command: &str,
-    arguments: Vec<String>,
-    working_directory: &str,
-    uid: u32,
-    gid: u32,
+    command_spec: &ExecResponseAccept,
   ) {
     // Spawn a new process in pty
-    let mut child = tokio::process::Command::new(command)
-          .args(arguments)
-          .current_dir(working_directory)
-          .uid(uid)
-          .gid(gid)
+    let mut child = tokio::process::Command::new(&command_spec.command)
+          .args(&command_spec.arguments)
+          .current_dir(&command_spec.working_directory)
+          .uid(command_spec.uid)
+          .gid(command_spec.gid)
           .stdin(std::process::Stdio::piped())
           .stdout(std::process::Stdio::piped())
           .stderr(std::process::Stdio::piped())
@@ -397,7 +367,10 @@ impl russh::server::Handler for ServerHandler {
       self.client_address,
       self.client_id
     );
-    self.gatekeeper_make_auth_request(username, AuthRequestMethod::None)
+    self.gatekeeper_make_auth_request(&Credentials {
+      username: username.to_owned(),
+      method: CredentialsType::None,
+    })
   }
 
   async fn auth_password(self, username: &str, password: &str) -> Result<(Self, Auth), Self::Error> {
@@ -406,12 +379,12 @@ impl russh::server::Handler for ServerHandler {
       self.client_address,
       self.client_id
     );
-    self.gatekeeper_make_auth_request(
-      username,
-      AuthRequestMethod::Password {
-        password: password.to_string(),
+    self.gatekeeper_make_auth_request(&Credentials {
+      username: username.to_owned(),
+      method: CredentialsType::Password {
+        password: password.to_owned(),
       },
-    )
+    })
   }
 
   async fn auth_publickey(
@@ -419,16 +392,16 @@ impl russh::server::Handler for ServerHandler {
     username: &str,
     public_key: &russh_keys::key::PublicKey,
   ) -> Result<(Self, Auth), Self::Error> {
-    let public_key_algorithm = public_key.name();
+    let public_key_algorithm = public_key.name().to_owned();
     let public_key_base64 = public_key.public_key_base64();
     log::info!("[{} {}] auth_publickey: username: {username} public_key_algorithm: {public_key_algorithm} public_key_base64: {public_key_base64}", self.client_address, self.client_id);
-    self.gatekeeper_make_auth_request(
-      username,
-      AuthRequestMethod::PublicKey {
-        public_key_algorithm: public_key_algorithm.to_string(),
-        public_key_base64: public_key_base64.clone(),
+    self.gatekeeper_make_auth_request(&Credentials {
+      username: username.to_owned(),
+      method: CredentialsType::PublicKey {
+        public_key_algorithm,
+        public_key_base64,
       },
-    )
+    })
   }
 
   // Not a lot of logic here, but russh requires this handler.
@@ -509,8 +482,12 @@ impl russh::server::Handler for ServerHandler {
 
     let resp: ExecResponse = self.gatekeeper_call(&Request {
       client_address: self.client_address.to_string(),
+      client_id: self.client_id.to_string(),
       request: RequestType::Shell {
-        username: self.authed_username.clone().unwrap(),
+        verified_credentials: self
+          .verified_credentials
+          .clone()
+          .expect("shell_request called when verified_credentials is None"),
       },
     });
     self
@@ -551,8 +528,12 @@ impl russh::server::Handler for ServerHandler {
 
     let resp: ExecResponse = self.gatekeeper_call(&Request {
       client_address: self.client_address.to_string(),
+      client_id: self.client_id.to_string(),
       request: RequestType::Exec {
-        username: self.authed_username.clone().unwrap(),
+        verified_credentials: self
+          .verified_credentials
+          .clone()
+          .expect("exec_request called when verified_credentials is None"),
         command: command_string.to_string(),
       },
     });

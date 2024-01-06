@@ -1,7 +1,9 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize)]
-pub enum AuthRequestMethod {
+#[derive(Serialize, Clone)]
+pub enum CredentialsType {
   None,
   Password {
     password: String,
@@ -12,35 +14,38 @@ pub enum AuthRequestMethod {
   },
 }
 
+#[derive(Serialize, Clone)]
+pub struct Credentials {
+  pub username: String,
+  pub method: CredentialsType,
+}
+
 #[derive(Serialize)]
 pub enum RequestType {
   Auth {
-    username: String,
-    method: AuthRequestMethod,
+    unverified_credentials: Credentials,
   },
   Shell {
-    username: String,
+    verified_credentials: Credentials,
   },
   Exec {
-    username: String,
+    verified_credentials: Credentials,
     command: String,
   },
 }
 
 #[derive(Serialize)]
-/// Example Auth requests:
-///   - {'client_address': '127.0.0.1:50710', 'request': {'Auth': {'username': 'sam', 'method': 'None'}}}
-///   - {'client_address': '127.0.0.1:51591', 'request': {'Auth': {'username': 'sam', 'method': {'Password': {'password': 'topsecret'}}}}}
-///   - {'client_address': '127.0.0.1:51636', 'request': {'Auth': {'username': 'sam', 'method': {'PublicKey': {'public_key_algorithm': 'ssh-ed25519', 'public_key_base64': 'AAA...wLq'}}}}}
-///
-/// Example Shell requests:
-///   - {'client_address': '127.0.0.1:51591', 'request': {'Shell': {'username': 'skainswo'}}}
-///
-/// Example Exec requests:
-///   - {'client_address': '127.0.0.1:56797', 'request': {'Exec': {'username': 'skainswo', 'command': 'ls -al'}}}
+/// See ./examples/basic.py for example values.
 pub struct Request {
   /// The address of the client that sent the request.
   pub client_address: String,
+
+  /// A unique identifier for the client connection. These are assigned randomly by sshenanigans upon receiving a new
+  /// connection. `client_id` can be used to identify a client across multiple gatekeeper requests. Note however that a
+  /// single user or machine may maintain multiple connections, each with their own `client_id`, in the same way that
+  /// you may have multiple browser tabs connected to the same website.
+  pub client_id: String,
+
   /// The request.
   pub request: RequestType,
 }
@@ -56,11 +61,11 @@ pub struct ExecResponse {
 #[derive(Deserialize)]
 pub struct ExecResponseAccept {
   /// The command to execute.
-  pub command: String,
+  pub command: PathBuf,
   /// Arguments to pass to the command.
   pub arguments: Vec<String>,
   /// The working directory to execute the command in.
-  pub working_directory: String,
+  pub working_directory: PathBuf,
   /// The user to execute the command as.
   pub uid: u32,
   /// The group to execute the command as.

@@ -42,17 +42,19 @@ if "Auth" in request:
   # flip a coin, launch a rocket, etc.
   #
   # Example requests:
-  #   - {'client_address': '127.0.0.1:50710', 'request': {'Auth': {'username': 'sam', 'method': 'None'}}}
-  #   - {'client_address': '127.0.0.1:51591', 'request': {'Auth': {'username': 'sam', 'method': {'Password': {'password': 'topsecret'}}}}}
-  #   - {'client_address': '127.0.0.1:51636', 'request': {'Auth': {'username': 'sam', 'method': {'PublicKey': {'public_key_algorithm': 'ssh-ed25519', 'public_key_base64': 'AAA...wLq'}}}}}
+  #   - {'client_address': '127.0.0.1:63895', 'client_id': '62783347-a23f-42d6-b05b-0c107384f583', 'request': {'Auth': {'unverified_credentials': {'username': 'sam', 'method': 'None'}}}}
+  #   - {'client_address': '127.0.0.1:63895', 'client_id': '62783347-a23f-42d6-b05b-0c107384f583', 'request': {'Auth': {'unverified_credentials': {'username': 'sam', 'method': {'Password': {'password': 'topsecret'}}}}}}
+  #   - {'client_address': '127.0.0.1:63895', 'client_id': '62783347-a23f-42d6-b05b-0c107384f583', 'request': {'Auth': {'unverified_credentials': {'username': 'sam', 'method': {'PublicKey': {'public_key_algorithm': 'ssh-ed25519', 'public_key_base64': 'AAA...wLq'}}}}}}
 
   # A username will always be provided, regardless of the authentication method:
-  username = request["Auth"]["username"]
+  unverified_credentials = request["Auth"]["unverified_credentials"]
+  username = unverified_credentials["username"]
+  method = unverified_credentials["method"]
 
   # There are 3 types of authentication methods that can be used: "None",
   # "Password", and "PublicKey". For the purposes of this demo, we'll only allow
   # the "Password" method.
-  password = "Password" in request["Auth"]["method"] and request["Auth"]["method"]["Password"]["password"]
+  password = "Password" in method and method["Password"]["password"]
   if username == "sam" and password == "topsecret":
     respond({ "accept": True })
   else:
@@ -67,7 +69,7 @@ elif "Shell" in request:
   # https://github.com/ajeetdsouza/clidle, you could accept the request and run
   # your CLI game of choice.
   #
-  # Example: {'client_address': '127.0.0.1:51591', 'request': {'Shell': {'username': 'sam'}}}
+  # Example: {'client_address': '127.0.0.1:63895', 'client_id': '62783347-a23f-42d6-b05b-0c107384f583', 'request': {'Shell': {'verified_credentials': {'username': 'sam', 'method': {'Password': {'password': 'topsecret'}}}}}}
 
   # Note that we run with the same uid/gid as the current process. You should
   # modify this to suit your needs, and probably run as a non-root user.
@@ -87,7 +89,7 @@ elif "Exec" in request:
   # Ok, so the client has successfully authenticated and is now attempting to
   # execute a command.
   #
-  # Example: {'client_address': '127.0.0.1:56797', 'request': {'Exec': {'username': 'sam', 'command': 'ls -al'}}}
+  # Example: {'client_address': '127.0.0.1:63982', 'client_id': '26fff0f2-b747-46f8-b65a-59af30897eea', 'request': {'Exec': {'verified_credentials': {'username': 'sam', 'method': {'Password': {'password': 'topsecret'}}}, 'command': 'ls -al'}}}
 
   # Let's get the command and arguments that the client is attempting to run:
   cmd, *args = request["Exec"]["command"].split()

@@ -14,17 +14,19 @@ Features:
 
 There are three types of requests sent to The Gatekeeper: `Auth`, `Shell`, and `Exec`. The Gatekeeper will receive one request per invocation. The Gatekeeper should exit with status zero in nominal operation, even when rejecting requests. Exiting in a non-zero status code will cause sshenanigans to produce an error and reject the request.
 
+Every request includes `client_address` and `client_id` fields. `client_address` is the IP address and port of the client. `client_id` is a unique identifier for the client and can be useful for tracking a client across multiple requests. Note however that a single user or machine may maintain multiple connections, each with their own `client_id`, in the same way that you may have multiple browser tabs connected to the same website.
+
 ### `Auth` requests
 
 There are three types of `Auth` requests: `None`, `Password`, and `PublicKey`. For example,
 
 ```json
 {
-  "client_address": "127.0.0.1:50710",
+  "client_address": "127.0.0.1:63107",
+  "client_id": "62783347-a23f-42d6-b05b-0c107384f583",
   "request": {
     "Auth": {
-      "username": "sam",
-      "method": "None"
+      "unverified_credentials": { "username": "sam", "method": "None" }
     }
   }
 }
@@ -32,11 +34,14 @@ There are three types of `Auth` requests: `None`, `Password`, and `PublicKey`. F
 
 ```json
 {
-  "client_address": "127.0.0.1:51591",
+  "client_address": "127.0.0.1:63146",
+  "client_id": "62783347-a23f-42d6-b05b-0c107384f583",
   "request": {
     "Auth": {
-      "username": "sam",
-      "method": { "Password": { "password": "topsecret" } }
+      "unverified_credentials": {
+        "username": "sam",
+        "method": { "Password": { "password": "topsecret" } }
+      }
     }
   }
 }
@@ -44,14 +49,17 @@ There are three types of `Auth` requests: `None`, `Password`, and `PublicKey`. F
 
 ```json
 {
-  "client_address": "127.0.0.1:51636",
+  "client_address": "127.0.0.1:63155",
+  "client_id": "62783347-a23f-42d6-b05b-0c107384f583",
   "request": {
     "Auth": {
-      "username": "sam",
-      "method": {
-        "PublicKey": {
-          "public_key_algorithm": "ssh-ed25519",
-          "public_key_base64": "AAA...wLq"
+      "unverified_credentials": {
+        "username": "sam",
+        "method": {
+          "PublicKey": {
+            "public_key_algorithm": "ssh-ed25519",
+            "public_key_base64": "AAA...wLq"
+          }
         }
       }
     }
@@ -77,8 +85,13 @@ This request is associated with the standard invocation of `ssh user@host`. Requ
 
 ```json
 {
-  "client_address": "127.0.0.1:51591",
-  "request": { "Shell": { "username": "sam" } }
+  "client_address": "127.0.0.1:63166",
+  "client_id": "62783347-a23f-42d6-b05b-0c107384f583",
+  "request": {
+    "Shell": {
+      "verified_credentials": { "username": "sam", "method": "None" }
+    }
+  }
 }
 ```
 
@@ -104,10 +117,11 @@ This request is commonly triggered by invoking SSH with a command, eg. `ssh user
 
 ```json
 {
-  "client_address": "127.0.0.1:56797",
+  "client_address": "127.0.0.1:63173",
+  "client_id": "62783347-a23f-42d6-b05b-0c107384f583",
   "request": {
     "Exec": {
-      "username": "sam",
+      "verified_credentials": { "username": "sam", "method": "None" },
       "command": "ls -al"
     }
   }
