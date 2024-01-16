@@ -11,6 +11,7 @@ use sshenanigans::{
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -69,6 +70,20 @@ impl russh::server::Server for Server {
       stdin_writers: Arc::new(Mutex::new(HashMap::new())),
     }
   }
+}
+
+async fn close_channel(handle: &russh::server::Handle, channel_id: ChannelId, exit_status: &std::process::ExitStatus) {
+  // NOTE: .code() can return None when the child process is killed via a
+  // signal like ctrl-c.
+  let our_exit_status: u32 = match (exit_status.code(), exit_status.signal()) {
+    (Some(code), None) => code.try_into().unwrap_or(1),
+    (None, Some(signal)) => signal as u32 + 128,
+    _ => unreachable!(),
+  };
+
+  handle.exit_status_request(channel_id, our_exit_status).await.unwrap();
+  handle.eof(channel_id).await.unwrap();
+  handle.close(channel_id).await.unwrap();
 }
 
 /// SSH server flow for shell with PTY (eg `ssh foo@bar`):
@@ -258,14 +273,7 @@ impl ServerHandler {
     // Close the channel when child exits
     let ptys_ = Arc::clone(&self.ptys);
     tokio::spawn(async move {
-      let status = child.wait().await.unwrap().code().unwrap();
-      // The `.try_into().unwrap_or(1)` is necessary since `status` is an i32, but `exit_status_request` expects a u32.
-      handle
-        .exit_status_request(channel_id, status.try_into().unwrap_or(1))
-        .await
-        .unwrap();
-      handle.eof(channel_id).await.unwrap();
-      handle.close(channel_id).await.unwrap();
+      close_channel(&handle, channel_id, &child.wait().await.unwrap()).await;
 
       // Clean up things from our `pty_writers` and `pty_requested_sizes` `HashMap`s
       ptys_.lock().await.remove(&channel_id);
@@ -346,13 +354,7 @@ impl ServerHandler {
 
     // Close the channel when child exits
     tokio::spawn(async move {
-      let status = child.wait().await.unwrap().code().unwrap();
-      handle
-        .exit_status_request(channel_id, status.try_into().unwrap_or(1))
-        .await
-        .unwrap();
-      handle.eof(channel_id).await.unwrap();
-      handle.close(channel_id).await.unwrap();
+      close_channel(&handle, channel_id, &child.wait().await.unwrap()).await;
     });
   }
 }
