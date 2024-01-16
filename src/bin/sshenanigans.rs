@@ -47,6 +47,9 @@ struct ServerHandler {
   /// authentication.
   verified_credentials: Option<Credentials>,
 
+  /// Environment variables requested by the client via `env_request`.
+  requested_environment_variables: HashMap<String, String>,
+
   ptys: ChannelValue<PtyStuff>,
 
   /// Writer to the stdin of the child process associated with a channel.
@@ -66,6 +69,7 @@ impl russh::server::Server for Server {
       client_id,
       client_address,
       verified_credentials: None,
+      requested_environment_variables: HashMap::new(),
       ptys: Arc::new(Mutex::new(HashMap::new())),
       stdin_writers: Arc::new(Mutex::new(HashMap::new())),
     }
@@ -111,6 +115,7 @@ impl ServerHandler {
   /// Talk to the gatekeeper and parse its response.
   fn gatekeeper_call<O: DeserializeOwned>(&self, request: &Request) -> O {
     let start_time = std::time::Instant::now();
+    // The Gatekeeper is trusted and therefore does not require `env_clear()`.
     let mut child = std::process::Command::new(&self.gatekeeper_command)
       .args(&self.gatekeeper_args)
       .stdin(std::process::Stdio::piped())
@@ -253,6 +258,10 @@ impl ServerHandler {
   ) {
     // Spawn a new process in pty
     let mut child = pty_process::Command::new(&command_spec.command)
+          // Security critial: Use `env_clear()` so we don't inherit environment
+          // variables from the parent process.
+          .env_clear()
+          .envs(&command_spec.environment_variables)
           .args(&command_spec.arguments)
           .current_dir(&command_spec.working_directory)
           .uid(command_spec.uid)
@@ -301,6 +310,10 @@ impl ServerHandler {
   ) {
     // Spawn a new process in pty
     let mut child = tokio::process::Command::new(&command_spec.command)
+          // Security critial: Use `env_clear()` so we don't inherit environment
+          // variables from the parent process.
+          .env_clear()
+          .envs(&command_spec.environment_variables)
           .args(&command_spec.arguments)
           .current_dir(&command_spec.working_directory)
           .uid(command_spec.uid)
@@ -474,6 +487,32 @@ impl russh::server::Handler for ServerHandler {
     Ok((self, session))
   }
 
+  async fn env_request(
+    self,
+    channel: ChannelId,
+    variable_name: &str,
+    variable_value: &str,
+    session: Session,
+  ) -> Result<(Self, Session), Self::Error> {
+    log::info!(
+      "[{} {} {}] env_request: {variable_name}={variable_value}",
+      self.client_address,
+      self.client_id,
+      channel,
+    );
+
+    let mut env = self.requested_environment_variables;
+    env.insert(variable_name.to_owned(), variable_value.to_owned());
+
+    Ok((
+      Self {
+        requested_environment_variables: env,
+        ..self
+      },
+      session,
+    ))
+  }
+
   async fn shell_request(self, channel_id: ChannelId, mut session: Session) -> Result<(Self, Session), Self::Error> {
     log::info!(
       "[{} {} {}] shell_request",
@@ -490,6 +529,7 @@ impl russh::server::Handler for ServerHandler {
           .verified_credentials
           .clone()
           .expect("shell_request called when verified_credentials is None"),
+        requested_environment_variables: self.requested_environment_variables.clone(),
       },
     });
     self
@@ -536,6 +576,7 @@ impl russh::server::Handler for ServerHandler {
           .verified_credentials
           .clone()
           .expect("exec_request called when verified_credentials is None"),
+        requested_environment_variables: self.requested_environment_variables.clone(),
         command: command_string.to_string(),
       },
     });

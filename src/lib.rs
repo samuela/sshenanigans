@@ -1,6 +1,5 @@
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, path::PathBuf};
 
 #[derive(Serialize, Clone)]
 pub enum CredentialsType {
@@ -27,9 +26,11 @@ pub enum RequestType {
   },
   Shell {
     verified_credentials: Credentials,
+    requested_environment_variables: HashMap<String, String>,
   },
   Exec {
     verified_credentials: Credentials,
+    requested_environment_variables: HashMap<String, String>,
     command: String,
   },
 }
@@ -66,6 +67,8 @@ pub struct ExecResponseAccept {
   pub arguments: Vec<String>,
   /// The working directory to execute the command in.
   pub working_directory: PathBuf,
+  /// Environment variables to set for the command.
+  pub environment_variables: HashMap<String, String>,
   /// The user to execute the command as.
   pub uid: u32,
   /// The group to execute the command as.
