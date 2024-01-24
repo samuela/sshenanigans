@@ -371,7 +371,6 @@ impl ServerHandler {
     handle: russh::server::Handle,
     command_spec: &ExecResponseAccept,
   ) {
-    // Spawn a new process in pty
     let mut child = tokio::process::Command::new(&command_spec.command)
           // Security critial: Use `env_clear()` so we don't inherit environment
           // variables from the parent process.
