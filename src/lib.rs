@@ -41,10 +41,12 @@ pub struct Request {
   /// The address of the client that sent the request.
   pub client_address: String,
 
-  /// A unique identifier for the client connection. These are assigned randomly by sshenanigans upon receiving a new
-  /// connection. `client_id` can be used to identify a client across multiple gatekeeper requests. Note however that a
-  /// single user or machine may maintain multiple connections, each with their own `client_id`, in the same way that
-  /// you may have multiple browser tabs connected to the same website.
+  /// A unique identifier for the client connection. These are assigned randomly
+  /// by sshenanigans upon receiving a new connection. `client_id` can be used
+  /// to identify a client across multiple gatekeeper requests. Note however
+  /// that a single user or machine may maintain multiple connections, each with
+  /// their own `client_id`, in the same way that you may have multiple browser
+  /// tabs connected to the same website.
   pub client_id: String,
 
   /// The request.
@@ -54,8 +56,8 @@ pub struct Request {
 /// This is the response to a Request::Shell or Request::Exec request.
 #[derive(Deserialize)]
 pub struct ExecResponse {
-  /// If this is Some, then the request will be accepted and the command will be executed as specified. If this is None,
-  /// then the request will be rejected.
+  /// If this is Some, then the request will be accepted and the command will be
+  /// executed as specified. If this is None, then the request will be rejected.
   pub accept: Option<ExecResponseAccept>,
 }
 
@@ -79,8 +81,9 @@ pub struct ExecResponseAccept {
 pub struct AuthResponse {
   /// Whether to accept the authentication request.
   pub accept: bool,
-  /// Allowed values are specified in https://docs.rs/russh/latest/russh/struct.MethodSet.html. Currently they are
-  /// "NONE", "PASSWORD", "PUBLICKEY", "HOSTBASED", "KEYBOARD_INTERACTIVE" (case sensitive). A value is recommended when
+  /// Allowed values are specified in https://docs.rs/russh/latest/russh/struct.MethodSet.html.
+  /// Currently they are "NONE", "PASSWORD", "PUBLICKEY", "HOSTBASED",
+  /// "KEYBOARD_INTERACTIVE" (case sensitive). A value is recommended when
   /// accept is false.
   pub proceed_with_methods: Option<Vec<String>>,
 }
