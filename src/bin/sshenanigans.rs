@@ -109,6 +109,28 @@ async fn close_channel(
   handle.close(channel_id).await.unwrap();
 }
 
+async fn send_data(
+  client_address: Option<SocketAddr>,
+  client_id: Uuid,
+  channel_id: ChannelId,
+  handle: &russh::server::Handle,
+  data: &[u8],
+) {
+  // Note: this can sometimes result in an Err. Possibly due to the SSH client
+  // closing the channel before we can finish writing to it?
+  //
+  // TODO: debug and come up with a better solution
+  if let Err(e) = handle.data(channel_id, CryptoVec::from_slice(data)).await {
+    log::error!(
+      "[{:?} {} {}] sending data failed: {:?}",
+      client_address,
+      client_id,
+      channel_id,
+      e
+    );
+  }
+}
+
 /// SSH server flow for shell with PTY (eg `ssh foo@bar`):
 /// 1. Client connects and a new ServerHandler is created.
 /// 2. auth method, eg. auth_publickey
@@ -360,16 +382,15 @@ impl ServerHandler {
     // Read bytes from the child stdout and send them to the SSH client
     let mut stdout = child.stdout.take().unwrap();
     let handle_ = handle.clone();
+    let client_address_ = self.client_address.clone();
+    let client_id_ = self.client_id.clone();
     tokio::spawn(async move {
       let mut buffer = vec![0; 1024];
       while let Ok(n) = stdout.read(&mut buffer).await {
         if n == 0 {
           break;
         }
-        handle_
-          .data(channel_id, CryptoVec::from_slice(&buffer[0..n]))
-          .await
-          .unwrap();
+        send_data(client_address_, client_id_, channel_id, &handle_, &buffer[0..n]).await;
       }
     });
     // Now, same for stderr...
@@ -381,15 +402,7 @@ impl ServerHandler {
         if n == 0 {
           break;
         }
-        // TODO: this can sometimes result in a panic. Possibly due to the SSH client closing the channel before the
-        // child process is done writing to stderr? Or the child process exits, causing us to close the channel, and
-        // then we keep trying to write the remainder of stderr to the channel?
-        //
-        // Either way, we should fix, possibly with `tokio::select`. Bug will affect stdout as well.
-        handle_
-          .data(channel_id, CryptoVec::from_slice(&buffer[0..n]))
-          .await
-          .unwrap();
+        send_data(client_address_, client_id_, channel_id, &handle_, &buffer[0..n]).await;
       }
     });
 
@@ -514,10 +527,14 @@ impl russh::server::Handler for ServerHandler {
         if n == 0 {
           break;
         }
-        session_handle
-          .data(channel_id, CryptoVec::from_slice(&buffer[0..n]))
-          .await
-          .unwrap();
+        send_data(
+          self.client_address,
+          self.client_id,
+          channel_id,
+          &session_handle,
+          &buffer[0..n],
+        )
+        .await;
       }
     });
 
