@@ -41,7 +41,7 @@ struct ServerHandler {
   client_id: Uuid,
 
   /// The IP address of the client.
-  client_address: std::net::SocketAddr,
+  client_address: Option<SocketAddr>,
 
   /// The SSH protocol associates each channel with a user. This value will only be `Some` after a successful
   /// authentication.
@@ -58,11 +58,17 @@ struct ServerHandler {
 
 impl russh::server::Server for Server {
   type Handler = ServerHandler;
-  fn new_client(&mut self, client_address: Option<std::net::SocketAddr>) -> ServerHandler {
-    // NOTE: it's unclear from the russh docs how we would ever get a None value here.
-    let client_address = client_address.expect("client_address is None");
+  fn new_client(&mut self, client_address: Option<SocketAddr>) -> ServerHandler {
+    // Peculiar though it may be, it is possible in practice for
+    // `client_address` to be `None`. This seems to trace all the way back to
+    // getpeername errors. So far, the cleanest way to handle this seems to be
+    // to propagate the `Option`-ality all the way down and return `Err` types
+    // when we encounter a `None`.
+    //
+    // See https://github.com/warp-tech/russh/issues/226.
+
     let client_id = Uuid::new_v4();
-    log::info!("[{}] new client, assigning id {client_id}", client_address);
+    log::info!("[{:?}] new client, assigning id {client_id}", client_address);
     ServerHandler {
       gatekeeper_command: self.gatekeeper_command.clone(),
       gatekeeper_args: self.gatekeeper_args.clone(),
@@ -81,7 +87,7 @@ impl russh::server::Server for Server {
 }
 
 async fn close_channel(
-  client_address: Option<std::net::SocketAddr>,
+  client_address: Option<SocketAddr>,
   client_id: Uuid,
   handle: &russh::server::Handle,
   channel_id: ChannelId,
@@ -154,8 +160,19 @@ async fn send_data(
 /// in the flow.
 impl ServerHandler {
   /// Talk to the gatekeeper and parse its response.
-  fn gatekeeper_call<O: DeserializeOwned>(&self, request: &Request) -> O {
+  fn gatekeeper_call<O: DeserializeOwned>(&self, request: RequestType) -> Result<O, anyhow::Error> {
     let start_time = std::time::Instant::now();
+
+    let client_address = self
+      .client_address
+      .ok_or_else(|| anyhow::Error::msg("expected client_address"))?
+      .to_string();
+    let request = Request {
+      client_address,
+      client_id: self.client_id.to_string(),
+      request,
+    };
+
     // The Gatekeeper is trusted and therefore does not require `env_clear()`.
     let mut child = std::process::Command::new(&self.gatekeeper_command)
       .args(&self.gatekeeper_args)
@@ -164,7 +181,7 @@ impl ServerHandler {
       .spawn()
       .unwrap_or_else(|err| {
         log::error!(
-          "[{} {}] failed to spawn gatekeeper: {err:?}",
+          "[{:?} {}] failed to spawn gatekeeper: {err:?}",
           self.client_address,
           self.client_id,
         );
@@ -173,7 +190,7 @@ impl ServerHandler {
       });
     // NOTE: we don't log `request` since it can contain passwords.
     log::debug!(
-      "[{} {}] gatekeeper child spawned with pid: {}",
+      "[{:?} {}] gatekeeper child spawned with pid: {}",
       self.client_address,
       self.client_id,
       child.id()
@@ -189,7 +206,7 @@ impl ServerHandler {
 
     let output = child.wait_with_output().unwrap();
     log::debug!(
-      "[{} {}] gatekeeper took {:.2?}, output: {:?}",
+      "[{:?} {}] gatekeeper took {:.2?}, output: {:?}",
       self.client_address,
       self.client_id,
       start_time.elapsed(),
@@ -198,13 +215,13 @@ impl ServerHandler {
 
     assert!(
       output.status.success(),
-      "[{} {}] gatekeeper exited with a non-zero status code: {:?}",
+      "[{:?} {}] gatekeeper exited with a non-zero status code: {:?}",
       self.client_address,
       self.client_id,
       output.status.code().unwrap()
     );
 
-    serde_json::from_slice(&output.stdout).expect("Failed to parse gatekeeper stdout")
+    Ok(serde_json::from_slice(&output.stdout).expect("Failed to parse gatekeeper stdout"))
   }
 
   /// Send an auth request to the gatekeeper and parse its response.
@@ -212,18 +229,14 @@ impl ServerHandler {
     self,
     unverified_credentials: &Credentials,
   ) -> Result<(ServerHandler, Auth), <Self as russh::server::Handler>::Error> {
-    let response: AuthResponse = self.gatekeeper_call(&Request {
-      client_address: self.client_address.to_string(),
-      client_id: self.client_id.to_string(),
-      request: RequestType::Auth {
-        unverified_credentials: unverified_credentials.clone(),
-      },
-    });
+    let response: AuthResponse = self.gatekeeper_call(RequestType::Auth {
+      unverified_credentials: unverified_credentials.clone(),
+    })?;
 
     Ok(match response {
       AuthResponse { accept: true, .. } => {
         log::info!(
-          "[{} {}] received {{ accept: true }} from gatekeeper",
+          "[{:?} {}] received {{ accept: true }} from gatekeeper",
           self.client_address,
           self.client_id,
         );
@@ -241,7 +254,7 @@ impl ServerHandler {
         ..
       } => {
         log::info!(
-          "[{} {}] received {{ accept: false, proceed_with_methods: {:?} }} from gatekeeper",
+          "[{:?} {}] received {{ accept: false, proceed_with_methods: {:?} }} from gatekeeper",
           self.client_address,
           self.client_id,
           proceed_with_methods
@@ -310,7 +323,7 @@ impl ServerHandler {
           .spawn(&pty_stuff.pts)
           .expect("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.");
     log::info!(
-      "[{} {} {}] child spawned with pid: {}",
+      "[{:?} {} {}] child spawned with pid: {}",
       self.client_address,
       self.client_id,
       channel_id,
@@ -373,7 +386,13 @@ impl ServerHandler {
           .stderr(std::process::Stdio::piped())
           .spawn()
           .expect("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.");
-    log::info!("child spawned with pid: {}", child.id().unwrap());
+    log::info!(
+      "[{:?} {} {}] child spawned with pid: {}",
+      self.client_address,
+      self.client_id,
+      channel_id,
+      child.id().unwrap(),
+    );
 
     // Add stdin to our stdin_writers `HashMap` so that we can write to it later in `data`
     let stdin = child.stdin.take().unwrap();
@@ -428,7 +447,7 @@ impl russh::server::Handler for ServerHandler {
 
   async fn auth_none(self, username: &str) -> Result<(Self, Auth), Self::Error> {
     log::info!(
-      "[{} {}] auth_none: username: {username}",
+      "[{:?} {}] auth_none: username: {username}",
       self.client_address,
       self.client_id
     );
@@ -440,7 +459,7 @@ impl russh::server::Handler for ServerHandler {
 
   async fn auth_password(self, username: &str, password: &str) -> Result<(Self, Auth), Self::Error> {
     log::info!(
-      "[{} {}] auth_password: username: {username}",
+      "[{:?} {}] auth_password: username: {username}",
       self.client_address,
       self.client_id
     );
@@ -459,7 +478,7 @@ impl russh::server::Handler for ServerHandler {
   ) -> Result<(Self, Auth), Self::Error> {
     let public_key_algorithm = public_key.name().to_owned();
     let public_key_base64 = public_key.public_key_base64();
-    log::info!("[{} {}] auth_publickey: username: {username} public_key_algorithm: {public_key_algorithm} public_key_base64: {public_key_base64}", self.client_address, self.client_id);
+    log::info!("[{:?} {}] auth_publickey: username: {username} public_key_algorithm: {public_key_algorithm} public_key_base64: {public_key_base64}", self.client_address, self.client_id);
     self.gatekeeper_make_auth_request(&Credentials {
       username: username.to_owned(),
       method: CredentialsType::PublicKey {
@@ -476,7 +495,7 @@ impl russh::server::Handler for ServerHandler {
     session: Session,
   ) -> Result<(Self, bool, Session), Self::Error> {
     log::info!(
-      "[{} {} {}] channel_open_session",
+      "[{:?} {} {}] channel_open_session",
       self.client_address,
       self.client_id,
       channel.id()
@@ -495,7 +514,7 @@ impl russh::server::Handler for ServerHandler {
     modes: &[(russh::Pty, u32)],
     session: Session,
   ) -> Result<(Self, Session), Self::Error> {
-    log::info!("[{} {} {}] pty_request, channel_id: {channel_id}, term: {term}, col_width: {col_width}, row_height: {row_height}, pix_width: {pix_width}, pix_height: {pix_height}, modes: {modes:?}", self.client_address, self.client_id, channel_id);
+    log::info!("[{:?} {} {}] pty_request, channel_id: {channel_id}, term: {term}, col_width: {col_width}, row_height: {row_height}, pix_width: {pix_width}, pix_height: {pix_height}, modes: {modes:?}", self.client_address, self.client_id, channel_id);
 
     // TODO: We're currently ignoring the requested modes. We should probably do something with them.
 
@@ -549,7 +568,7 @@ impl russh::server::Handler for ServerHandler {
     session: Session,
   ) -> Result<(Self, Session), Self::Error> {
     log::info!(
-      "[{} {} {}] env_request: {variable_name}={variable_value}",
+      "[{:?} {} {}] env_request: {variable_name}={variable_value}",
       self.client_address,
       self.client_id,
       channel,
@@ -569,23 +588,19 @@ impl russh::server::Handler for ServerHandler {
 
   async fn shell_request(self, channel_id: ChannelId, mut session: Session) -> Result<(Self, Session), Self::Error> {
     log::info!(
-      "[{} {} {}] shell_request",
+      "[{:?} {} {}] shell_request",
       self.client_address,
       self.client_id,
       channel_id
     );
 
-    let resp: ExecResponse = self.gatekeeper_call(&Request {
-      client_address: self.client_address.to_string(),
-      client_id: self.client_id.to_string(),
-      request: RequestType::Shell {
-        verified_credentials: self
-          .verified_credentials
-          .clone()
-          .expect("shell_request called when verified_credentials is None"),
-        requested_environment_variables: self.requested_environment_variables.clone(),
-      },
-    });
+    let resp: ExecResponse = self.gatekeeper_call(RequestType::Shell {
+      verified_credentials: self
+        .verified_credentials
+        .clone()
+        .expect("shell_request called when verified_credentials is None"),
+      requested_environment_variables: self.requested_environment_variables.clone(),
+    })?;
     self
       .gatekeeper_handle_exec_response(channel_id, &mut session, resp)
       .await;
@@ -616,24 +631,20 @@ impl russh::server::Handler for ServerHandler {
   ) -> Result<(Self, Session), Self::Error> {
     let command_string = String::from_utf8(command.to_vec())?;
     log::info!(
-      "[{} {} {}] exec_request: command: {command_string}",
+      "[{:?} {} {}] exec_request: command: {command_string}",
       self.client_address,
       self.client_id,
       channel_id
     );
 
-    let resp: ExecResponse = self.gatekeeper_call(&Request {
-      client_address: self.client_address.to_string(),
-      client_id: self.client_id.to_string(),
-      request: RequestType::Exec {
-        verified_credentials: self
-          .verified_credentials
-          .clone()
-          .expect("exec_request called when verified_credentials is None"),
-        requested_environment_variables: self.requested_environment_variables.clone(),
-        command: command_string.to_string(),
-      },
-    });
+    let resp: ExecResponse = self.gatekeeper_call(RequestType::Exec {
+      verified_credentials: self
+        .verified_credentials
+        .clone()
+        .expect("exec_request called when verified_credentials is None"),
+      requested_environment_variables: self.requested_environment_variables.clone(),
+      command: command_string,
+    })?;
     self
       .gatekeeper_handle_exec_response(channel_id, &mut session, resp)
       .await;
@@ -651,7 +662,7 @@ impl russh::server::Handler for ServerHandler {
     pix_height: u32,
     session: Session,
   ) -> Result<(Self, Session), Self::Error> {
-    log::info!("[{} {} {}] window_change_request col_width = {col_width} row_height = {row_height}, pix_width = {pix_width}, pix_height = {pix_height}", self.client_address, self.client_id, channel_id);
+    log::info!("[{:?} {} {}] window_change_request col_width = {col_width} row_height = {row_height}, pix_width = {pix_width}, pix_height = {pix_height}", self.client_address, self.client_id, channel_id);
     if let Some(PtyStuff { pty_writer, .. }) = self.ptys.lock().await.get_mut(&channel_id) {
       if let Err(e) = pty_writer.resize(pty_process::Size::new(row_height as u16, col_width as u16)) {
         log::error!("pty.resize failed: {:?}", e);
@@ -665,7 +676,7 @@ impl russh::server::Handler for ServerHandler {
 
   async fn channel_close(self, channel_id: ChannelId, session: Session) -> Result<(Self, Session), Self::Error> {
     log::info!(
-      "[{} {} {}] channel_close",
+      "[{:?} {} {}] channel_close",
       self.client_address,
       self.client_id,
       channel_id
