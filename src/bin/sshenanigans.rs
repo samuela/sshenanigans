@@ -713,6 +713,14 @@ struct Args {
   /// The Gatekeeper command. Note that relative paths must start with ./ or similar.
   #[arg(long)]
   gatekeeper: String,
+
+  /// Optionally drop privileges to this user after binding to the socket.
+  #[arg(long)]
+  setuid: Option<u32>,
+
+  /// Optionally drop privileges to this group after binding to the socket.
+  #[arg(long)]
+  setgid: Option<u32>,
 }
 
 fn load_host_keys(host_key_paths: Vec<PathBuf>) -> Vec<russh_keys::key::KeyPair> {
@@ -749,10 +757,26 @@ async fn main() {
     keys: load_host_keys(args.host_key_path),
     ..Default::default()
   };
+
+  let socket = tokio::net::TcpListener::bind(&args.listen)
+    .await
+    .expect("Failed to bind to socket. Are you sure you have permissions to bind to the given socket address?");
+
+  // setgid before setuid, since generally speaking we won't have permission to
+  // setgid after setuid.
+  if let Some(gid) = args.setgid {
+    log::info!("Dropping privileges to gid {}", gid);
+    nix::unistd::setgid(nix::unistd::Gid::from_raw(gid)).expect("failed to drop privileges with setgid");
+  }
+  if let Some(uid) = args.setuid {
+    log::info!("Dropping privileges to uid {}", uid);
+    nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)).expect("failed to drop privileges with setuid");
+  }
+
   log::info!("Listening on {}", args.listen);
-  russh::server::run(
+  russh::server::run_on_socket(
     Arc::new(config),
-    &args.listen,
+    &socket,
     Server {
       // This indexing is safe since we assert that `gatekeeper_split` is not empty above.
       gatekeeper_command: gatekeeper_split[0].into(),
@@ -760,5 +784,5 @@ async fn main() {
     },
   )
   .await
-  .expect("Failed to start SSH server. Are you sure you have permissions to bind to the given socket address?");
+  .expect("failed to run SSH server main loop");
 }

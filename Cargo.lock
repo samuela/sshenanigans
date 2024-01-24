@@ -832,6 +832,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.27.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2eb04e9c688eff1c89d72b407f168cf79bb9e867a9d3323ed6c01519eb9cc053"
+dependencies = [
+ "bitflags 2.4.1",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "num-bigint"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -908,6 +919,20 @@ dependencies = [
  "ecdsa",
  "elliptic-curve",
  "primeorder",
+ "sha2",
+]
+
+[[package]]
+name = "p521"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fc9e2161f1f215afdfce23677034ae137bbd45016a880c2eb3ba8eb95f085b2"
+dependencies = [
+ "base16ct",
+ "ecdsa",
+ "elliptic-curve",
+ "primeorder",
+ "rand_core 0.6.4",
  "sha2",
 ]
 
@@ -1178,9 +1203,8 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.40.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93dab9e1c313d0d04a42e39c0995943fc38c037e2e3fa9c33685777a1aecdfb2"
+version = "0.41.0-beta.2"
+source = "git+https://github.com/samuela/russh.git?rev=ea64035c504984f99d18b49d935dc97d5ecdb396#ea64035c504984f99d18b49d935dc97d5ecdb396"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1214,8 +1238,7 @@ dependencies = [
 [[package]]
 name = "russh-cryptovec"
 version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b077b6dd8d8c085dac62f7fcc5a83df60c7f7a22d49bfba994f2f4dbf60bc74"
+source = "git+https://github.com/samuela/russh.git?rev=ea64035c504984f99d18b49d935dc97d5ecdb396#ea64035c504984f99d18b49d935dc97d5ecdb396"
 dependencies = [
  "libc",
  "winapi",
@@ -1223,9 +1246,8 @@ dependencies = [
 
 [[package]]
 name = "russh-keys"
-version = "0.40.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d0de3cb3cbfa773b7f170b6830565fac207a0d630cc666a29f80097cc374dd8"
+version = "0.41.0-beta.1"
+source = "git+https://github.com/samuela/russh.git?rev=ea64035c504984f99d18b49d935dc97d5ecdb396#ea64035c504984f99d18b49d935dc97d5ecdb396"
 dependencies = [
  "aes",
  "async-trait",
@@ -1246,6 +1268,7 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "p256",
+ "p521",
  "pbkdf2 0.11.0",
  "rand 0.7.3",
  "rand_core 0.6.4",
@@ -1424,6 +1447,7 @@ dependencies = [
  "clap",
  "env_logger",
  "log",
+ "nix",
  "pty-process",
  "russh",
  "russh-keys",

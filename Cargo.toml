@@ -18,10 +18,15 @@ async-trait = "*"
 clap = { version = "*", features = ["derive"] }
 env_logger = "*"
 log = "*"
+nix = { version = "*", features = ["user"] }
+
 # See https://github.com/doy/pty-process/pull/8#issuecomment-1829236622.
 pty-process = { git = "https://github.com/mobusoperandi/pty-process.git", rev = "78896303a47c370e6cd5527267d8db696ffc62f1", features = ["async"] }
-russh = "*"
-russh-keys = "*"
+
+# See https://github.com/warp-tech/russh/pull/231.
+russh = { git = "https://github.com/samuela/russh.git", rev = "ea64035c504984f99d18b49d935dc97d5ecdb396" }
+russh-keys = { git = "https://github.com/samuela/russh.git", rev = "ea64035c504984f99d18b49d935dc97d5ecdb396" }
+
 serde = "*"
 serde_json = "*"
 tokio = { version = "*" }
