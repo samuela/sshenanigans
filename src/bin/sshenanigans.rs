@@ -101,7 +101,7 @@ async fn close_channel(
     _ => unreachable!(),
   };
 
-  // Note: this can fail. I have no idea why.
+  // Note: `exit_status_request` and `eof` can fail. I have no idea why.
   if let Err(e) = handle.exit_status_request(channel_id, our_exit_status).await {
     log::error!(
       "[{:?} {} {}] sending exit status failed: {:?}",
@@ -111,7 +111,15 @@ async fn close_channel(
       e
     );
   }
-  handle.eof(channel_id).await.unwrap();
+  if let Err(e) = handle.eof(channel_id).await {
+    log::error!(
+      "[{:?} {} {}] sending eof failed: {:?}",
+      client_address,
+      client_id,
+      channel_id,
+      e
+    );
+  }
   handle.close(channel_id).await.unwrap();
 }
 
