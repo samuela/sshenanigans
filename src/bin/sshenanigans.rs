@@ -74,6 +74,10 @@ impl russh::server::Server for Server {
       stdin_writers: Arc::new(Mutex::new(HashMap::new())),
     }
   }
+
+  fn handle_session_error(&mut self, error: <Self::Handler as russh::server::Handler>::Error) {
+    log::error!("session error: {:?}", error);
+  }
 }
 
 async fn close_channel(
