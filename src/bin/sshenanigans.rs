@@ -76,7 +76,13 @@ impl russh::server::Server for Server {
   }
 }
 
-async fn close_channel(handle: &russh::server::Handle, channel_id: ChannelId, exit_status: &std::process::ExitStatus) {
+async fn close_channel(
+  client_address: Option<std::net::SocketAddr>,
+  client_id: Uuid,
+  handle: &russh::server::Handle,
+  channel_id: ChannelId,
+  exit_status: &std::process::ExitStatus,
+) {
   // NOTE: .code() can return None when the child process is killed via a
   // signal like ctrl-c.
   let our_exit_status: u32 = match (exit_status.code(), exit_status.signal()) {
@@ -85,7 +91,16 @@ async fn close_channel(handle: &russh::server::Handle, channel_id: ChannelId, ex
     _ => unreachable!(),
   };
 
-  handle.exit_status_request(channel_id, our_exit_status).await.unwrap();
+  // Note: this can fail. I have no idea why.
+  if let Err(e) = handle.exit_status_request(channel_id, our_exit_status).await {
+    log::error!(
+      "[{:?} {} {}] sending exit status failed: {:?}",
+      client_address,
+      client_id,
+      channel_id,
+      e
+    );
+  }
   handle.eof(channel_id).await.unwrap();
   handle.close(channel_id).await.unwrap();
 }
@@ -281,8 +296,17 @@ impl ServerHandler {
 
     // Close the channel when child exits
     let ptys_ = Arc::clone(&self.ptys);
+    let client_address_ = self.client_address.clone();
+    let client_id_ = self.client_id.clone();
     tokio::spawn(async move {
-      close_channel(&handle, channel_id, &child.wait().await.unwrap()).await;
+      close_channel(
+        client_address_,
+        client_id_,
+        &handle,
+        channel_id,
+        &child.wait().await.unwrap(),
+      )
+      .await;
 
       // Clean up things from our `pty_writers` and `pty_requested_sizes` `HashMap`s
       ptys_.lock().await.remove(&channel_id);
@@ -366,8 +390,17 @@ impl ServerHandler {
     });
 
     // Close the channel when child exits
+    let client_address_ = self.client_address.clone();
+    let client_id_ = self.client_id.clone();
     tokio::spawn(async move {
-      close_channel(&handle, channel_id, &child.wait().await.unwrap()).await;
+      close_channel(
+        client_address_,
+        client_id_,
+        &handle,
+        channel_id,
+        &child.wait().await.unwrap(),
+      )
+      .await;
     });
   }
 }
