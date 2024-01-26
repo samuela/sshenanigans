@@ -1055,7 +1055,7 @@ dependencies = [
 [[package]]
 name = "pty-process"
 version = "0.4.0"
-source = "git+https://github.com/mobusoperandi/pty-process.git?rev=78896303a47c370e6cd5527267d8db696ffc62f1#78896303a47c370e6cd5527267d8db696ffc62f1"
+source = "git+https://github.com/samuela/pty-process.git?rev=968c2dc6af18addce179e9396f50bac6c1ee0cca#968c2dc6af18addce179e9396f50bac6c1ee0cca"
 dependencies = [
  "libc",
  "rustix",

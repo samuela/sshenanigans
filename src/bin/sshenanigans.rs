@@ -18,6 +18,22 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+struct AbortOnDrop {
+  inner: tokio::task::AbortHandle,
+}
+impl AbortOnDrop {
+  fn new<T>(inner: tokio::task::JoinHandle<T>) -> Self {
+    Self {
+      inner: inner.abort_handle(),
+    }
+  }
+}
+impl Drop for AbortOnDrop {
+  fn drop(&mut self) {
+    self.inner.abort();
+  }
+}
+
 struct Server {
   gatekeeper_command: PathBuf,
   gatekeeper_args: Vec<String>,
@@ -54,6 +70,21 @@ struct ServerHandler {
 
   /// Writer to the stdin of the child process associated with a channel.
   stdin_writers: ChannelValue<tokio::process::ChildStdin>,
+
+  /// For each channel, a handle that when dropped will abort a tokio task
+  /// owning the corresponding child process for that channel. This is necessary
+  /// to prevent process leakage. There are two ways these Droppings come in
+  /// handy:
+  /// 1. We manually drop these in `close_channel` to kill the child process.
+  /// 2. `ServerHandler` will be dropped when the SSH client disconnects,
+  ///    cleanly or not. This can happen eg when the inactivity timeout
+  ///    threshold is violated. When this happens, the `ServerHandler` will be
+  ///    dropped (https://github.com/warp-tech/russh/issues/229), which will
+  ///    drop all `AbortOnDrop`s, which will abort their corresponding tokio
+  ///    tasks, each of which own a `tokio::process::Child` process. These
+  ///    children have `kill_on_drop(true)` set, so they will be killed by tokio
+  ///    automatically.
+  child_abort_handles: ChannelValue<AbortOnDrop>,
 }
 
 impl russh::server::Server for Server {
@@ -78,6 +109,7 @@ impl russh::server::Server for Server {
       requested_environment_variables: HashMap::new(),
       ptys: Arc::new(Mutex::new(HashMap::new())),
       stdin_writers: Arc::new(Mutex::new(HashMap::new())),
+      child_abort_handles: Arc::new(Mutex::new(HashMap::new())),
     }
   }
 
@@ -194,16 +226,7 @@ impl ServerHandler {
       .args(&self.gatekeeper_args)
       .stdin(std::process::Stdio::piped())
       .stdout(std::process::Stdio::piped())
-      .spawn()
-      .unwrap_or_else(|err| {
-        log::error!(
-          "[{:?} {}] failed to spawn gatekeeper: {err:?}",
-          self.client_address,
-          self.client_id,
-        );
-        // If we can't spawn the gatekeeper, we can't do much else, so we exit.
-        std::process::exit(1);
-      });
+      .spawn()?;
     // NOTE: we don't log `request` since it can contain passwords.
     log::debug!(
       "[{:?} {}] gatekeeper child spawned with pid: {}",
@@ -318,6 +341,28 @@ impl ServerHandler {
     }
   }
 
+  /// Spawn a task to close the SSH channel when the child process exits. Move
+  /// ownership of the child process to the task, and add an `AbortHandle` for
+  /// the task to `self.child_abort_handles`. This is necessary to prevent
+  /// leaking processes.
+  async fn close_channel_on_child_exit(
+    &self,
+    channel_id: ChannelId,
+    handle: russh::server::Handle,
+    mut child: tokio::process::Child,
+  ) {
+    let client_address_ = self.client_address.clone();
+    let client_id_ = self.client_id.clone();
+    self.child_abort_handles.lock().await.insert(
+      channel_id,
+      AbortOnDrop::new(tokio::spawn(async move {
+        let exit_status = child.wait().await.unwrap();
+        close_channel(client_address_, client_id_, &handle, channel_id, &exit_status).await;
+        drop(child);
+      })),
+    );
+  }
+
   /// Execute a command in a given PTY. Upon exit, close the SSH channel.
   async fn pty_exec(
     &self,
@@ -327,10 +372,12 @@ impl ServerHandler {
     command_spec: &ExecResponseAccept,
   ) {
     // Spawn a new process in pty
-    let mut child = pty_process::Command::new(&command_spec.command)
+    let child = pty_process::Command::new(&command_spec.command)
           // Security critial: Use `env_clear()` so we don't inherit environment
           // variables from the parent process.
           .env_clear()
+          // kill_on_drop(true) is essential to prevent leaking processes.
+          .kill_on_drop(true)
           .envs(&command_spec.environment_variables)
           .args(&command_spec.arguments)
           .current_dir(&command_spec.working_directory)
@@ -346,38 +393,22 @@ impl ServerHandler {
       child.id().unwrap()
     );
 
-    // NOTE: we already set up a task to read from the PTY and send to the SSH client in `pty_request`, so we don't need
-    // to do it here.
-
-    // Close the channel when child exits
-    let ptys_ = Arc::clone(&self.ptys);
-    let client_address_ = self.client_address.clone();
-    let client_id_ = self.client_id.clone();
-    tokio::spawn(async move {
-      close_channel(
-        client_address_,
-        client_id_,
-        &handle,
-        channel_id,
-        &child.wait().await.unwrap(),
-      )
-      .await;
-
-      // Clean up things from our `pty_writers` and `pty_requested_sizes` `HashMap`s
-      ptys_.lock().await.remove(&channel_id);
-    });
-
-    // Resize the PTY according to the requested size. We don't do this at PTY creation time since we can't resize until
-    // after the child is spawned on macOS. See https://github.com/doy/pty-process/issues/7#issuecomment-1826196215 and
-    // https://github.com/pkgw/stund/issues/305.
-
-    // NOTE: pty_process::Size::new flips the order of col_width and row_height!
+    // Notes:
+    // 1. We already set up a task to read from the PTY and send to the SSH
+    //    client in `pty_request`, so we don't need to do it here.
+    // 2. We must resize the PTY according to the requested size. We don't do
+    //    this at PTY creation time since we can't resize until after the child
+    //    is spawned on macOS. See https://github.com/doy/pty-process/issues/7#issuecomment-1826196215
+    //    and https://github.com/pkgw/stund/issues/305.
+    // 3. `pty_process::Size::new` flips the order of col_width and row_height!
     if let Err(e) = pty_stuff.pty_writer.resize(pty_process::Size::new(
       pty_stuff.requested_row_height,
       pty_stuff.requested_col_width,
     )) {
       log::error!("pty.resize failed: {:?}", e);
     }
+
+    self.close_channel_on_child_exit(channel_id, handle, child).await;
   }
 
   /// Execute a command without a PTY.
@@ -391,6 +422,8 @@ impl ServerHandler {
           // Security critial: Use `env_clear()` so we don't inherit environment
           // variables from the parent process.
           .env_clear()
+          // kill_on_drop(true) is essential to prevent leaking processes.
+          .kill_on_drop(true)
           .envs(&command_spec.environment_variables)
           .args(&command_spec.arguments)
           .current_dir(&command_spec.working_directory)
@@ -440,19 +473,7 @@ impl ServerHandler {
       }
     });
 
-    // Close the channel when child exits
-    let client_address_ = self.client_address.clone();
-    let client_id_ = self.client_id.clone();
-    tokio::spawn(async move {
-      close_channel(
-        client_address_,
-        client_id_,
-        &handle,
-        channel_id,
-        &child.wait().await.unwrap(),
-      )
-      .await;
-    });
+    self.close_channel_on_child_exit(channel_id, handle, child).await;
   }
 }
 
@@ -697,9 +718,15 @@ impl russh::server::Handler for ServerHandler {
       channel_id
     );
 
-    // Clean up things from our `HashMap`s
-    self.ptys.lock().await.remove(&channel_id);
-    self.stdin_writers.lock().await.remove(&channel_id);
+    // Removing from `self.child_abort_handles` and dropping results in the
+    // corresponding child process being killed. This is important since we
+    // don't want to leak processes. Child processes will be killed since
+    // child_abort_handles contains `AbortOnDrop`s which contain
+    // `tokio::task::AbortHandle`s for tokio tasks that own
+    // `tokio::process::Child`s that have `kill_on_drop(true)` set.
+    drop(self.child_abort_handles.lock().await.remove(&channel_id));
+    drop(self.ptys.lock().await.remove(&channel_id));
+    drop(self.stdin_writers.lock().await.remove(&channel_id));
 
     Ok((self, session))
   }
