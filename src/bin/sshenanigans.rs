@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 use async_trait::async_trait;
 use clap::Parser;
 use pty_process::OwnedWritePty;
@@ -197,13 +197,10 @@ impl ServerHandler {
   /// Talk to the gatekeeper and parse its response.
   // NOTE: we don't log `request` since it can contain passwords.
   #[tracing::instrument(level = "debug", skip(self, request))]
-  fn gatekeeper_call<O: DeserializeOwned>(&self, request: RequestType) -> Result<O, anyhow::Error> {
+  fn gatekeeper_call<O: DeserializeOwned>(&self, request: RequestType) -> anyhow::Result<O> {
     let start_time = std::time::Instant::now();
 
-    let client_address = self
-      .client_address
-      .ok_or_else(|| anyhow::Error::msg("expected client_address"))?
-      .to_string();
+    let client_address = self.client_address.context("expected client_address")?.to_string();
     let request = Request {
       client_address,
       client_id: self.client_id.to_string(),
@@ -222,11 +219,17 @@ impl ServerHandler {
     child
       .stdin
       .as_mut()
-      .unwrap()
-      .write_all(serde_json::to_string(&request).unwrap().as_bytes())
-      .unwrap();
+      .context("Failed to get stdin for gatekeeper child")?
+      .write_all(
+        serde_json::to_string(&request)
+          .context("Failed to serialize request as JSON")?
+          .as_bytes(),
+      )
+      .context("Failed to write to gatekeeper child stdin")?;
 
-    let output = child.wait_with_output().unwrap();
+    let output = child
+      .wait_with_output()
+      .context("Failed to wait for gatekeeper child")?;
     tracing::debug!(
       elapsed = ?start_time.elapsed(),
       ?output,
@@ -237,7 +240,7 @@ impl ServerHandler {
     if exit_status.success() {
       serde_json::from_slice(&output.stdout).context("Failed to parse gatekeeper stdout")
     } else {
-      anyhow::bail!("The Gatekeeper exited with a non-zero status code, {exit_status}. The Gatekeeper should never exit with a non-zero status code, even when rejecting requests.");
+      bail!("The Gatekeeper exited with a non-zero status code, {exit_status}. The Gatekeeper should never exit with a non-zero status code, even when rejecting requests.");
     }
   }
 
@@ -413,11 +416,11 @@ impl ServerHandler {
     tracing::info!(pid = child.id(), "child spawned");
 
     // Add stdin to our stdin_writers `HashMap` so that we can write to it later in `data`
-    let stdin = child.stdin.take().unwrap();
+    let stdin = child.stdin.take().context("Failed to get stdin for child process")?;
     self.stdin_writers.lock().await.insert(channel_id, stdin);
 
     // Read bytes from the child stdout and send them to the SSH client
-    let mut stdout = child.stdout.take().unwrap();
+    let mut stdout = child.stdout.take().context("Failed to get stdout for child process")?;
     let handle_ = handle.clone();
     let client_address_ = self.client_address;
     let client_id_ = self.client_id;
@@ -431,7 +434,7 @@ impl ServerHandler {
       }
     });
     // Now, same for stderr...
-    let mut stderr = child.stderr.take().unwrap();
+    let mut stderr = child.stderr.take().context("Failed to get stderr for child process")?;
     let handle_ = handle.clone();
     tokio::spawn(async move {
       let mut buffer = vec![0; 1024];
@@ -513,9 +516,9 @@ impl russh::server::Handler for ServerHandler {
   ) -> Result<(Self, Session), Self::Error> {
     // TODO: We're currently ignoring the requested modes. We should probably do something with them.
 
-    let pty = pty_process::Pty::new().unwrap();
+    let pty = pty_process::Pty::new().context("Failed to create PTY")?;
     // NOTE: we must get `pts` before `.into_split()` because it consumes the PTY.
-    let pts = pty.pts().unwrap();
+    let pts = pty.pts().context("Failed to get pts")?;
 
     // split pty into reader + writer
     let (mut pty_reader, pty_writer) = pty.into_split();
@@ -596,10 +599,10 @@ impl russh::server::Handler for ServerHandler {
   async fn data(self, channel_id: ChannelId, data: &[u8], session: Session) -> Result<(Self, Session), Self::Error> {
     if let Some(PtyStuff { pty_writer, .. }) = self.ptys.lock().await.get_mut(&channel_id) {
       tracing::debug!(?data, "writing to pty_writer");
-      pty_writer.write_all(data).await.unwrap();
+      pty_writer.write_all(data).await.context("Failed to write to PTY")?;
     } else if let Some(stdin_writer) = self.stdin_writers.lock().await.get_mut(&channel_id) {
       tracing::debug!(?data, "writing to stdin_writer");
-      stdin_writer.write_all(data).await.unwrap();
+      stdin_writer.write_all(data).await.context("Failed to write to stdin")?;
     } else {
       tracing::warn!("could not find outlet for data, skipping write");
     }
@@ -715,7 +718,7 @@ fn load_host_keys(host_key_paths: Vec<PathBuf>) -> Vec<russh_keys::key::KeyPair>
 }
 
 #[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
+async fn main() -> anyhow::Result<()> {
   tracing_subscriber::registry()
     .with(
       tracing_subscriber::fmt::layer()
