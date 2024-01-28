@@ -1,3 +1,4 @@
+use anyhow::Context;
 use async_trait::async_trait;
 use clap::Parser;
 use pty_process::OwnedWritePty;
@@ -260,7 +261,7 @@ impl ServerHandler {
       output.status.code().unwrap()
     );
 
-    Ok(serde_json::from_slice(&output.stdout).expect("Failed to parse gatekeeper stdout"))
+    Ok(serde_json::from_slice(&output.stdout).context("Failed to parse gatekeeper stdout")?)
   }
 
   /// Send an auth request to the gatekeeper and parse its response.
@@ -268,9 +269,11 @@ impl ServerHandler {
     self,
     unverified_credentials: &Credentials,
   ) -> Result<(ServerHandler, Auth), <Self as russh::server::Handler>::Error> {
-    let response: AuthResponse = self.gatekeeper_call(RequestType::Auth {
-      unverified_credentials: unverified_credentials.clone(),
-    })?;
+    let response: AuthResponse = self
+      .gatekeeper_call(RequestType::Auth {
+        unverified_credentials: unverified_credentials.clone(),
+      })
+      .context("Failed to call gatekeeper")?;
 
     Ok(match response {
       AuthResponse { accept: true, .. } => {
@@ -322,15 +325,15 @@ impl ServerHandler {
     channel_id: ChannelId,
     session: &mut Session,
     response: ExecResponse,
-  ) {
+  ) -> Result<(), <Self as russh::server::Handler>::Error> {
     match response.accept {
       Some(cmd) => {
         log::debug!("gatekeeper accepted exec request");
 
         let handle = session.handle();
         match self.ptys.lock().await.get(&channel_id) {
-          Some(pty_stuff) => self.pty_exec(channel_id, handle, pty_stuff, &cmd).await,
-          None => self.non_pty_exec(channel_id, handle, &cmd).await,
+          Some(pty_stuff) => self.pty_exec(channel_id, handle, pty_stuff, &cmd).await?,
+          None => self.non_pty_exec(channel_id, handle, &cmd).await?,
         }
       }
       None => {
@@ -339,6 +342,7 @@ impl ServerHandler {
         session.close(channel_id);
       }
     }
+    Ok(())
   }
 
   /// Spawn a task to close the SSH channel when the child process exits. Move
@@ -370,7 +374,7 @@ impl ServerHandler {
     handle: russh::server::Handle,
     pty_stuff: &PtyStuff,
     command_spec: &ExecResponseAccept,
-  ) {
+  ) -> Result<(), <Self as russh::server::Handler>::Error> {
     // Spawn a new process in pty
     let child = pty_process::Command::new(&command_spec.command)
           // Security critial: Use `env_clear()` so we don't inherit environment
@@ -384,7 +388,7 @@ impl ServerHandler {
           .uid(command_spec.uid)
           .gid(command_spec.gid)
           .spawn(&pty_stuff.pts)
-          .expect("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.");
+          .context("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.")?;
     log::info!(
       "[{:?} {} {}] child spawned with pid: {}",
       self.client_address,
@@ -409,6 +413,7 @@ impl ServerHandler {
     }
 
     self.close_channel_on_child_exit(channel_id, handle, child).await;
+    Ok(())
   }
 
   /// Execute a command without a PTY.
@@ -417,7 +422,7 @@ impl ServerHandler {
     channel_id: ChannelId,
     handle: russh::server::Handle,
     command_spec: &ExecResponseAccept,
-  ) {
+  ) -> Result<(), <Self as russh::server::Handler>::Error> {
     let mut child = tokio::process::Command::new(&command_spec.command)
           // Security critial: Use `env_clear()` so we don't inherit environment
           // variables from the parent process.
@@ -433,7 +438,7 @@ impl ServerHandler {
           .stdout(std::process::Stdio::piped())
           .stderr(std::process::Stdio::piped())
           .spawn()
-          .expect("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.");
+          .context("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.")?;
     log::info!(
       "[{:?} {} {}] child spawned with pid: {}",
       self.client_address,
@@ -474,6 +479,7 @@ impl ServerHandler {
     });
 
     self.close_channel_on_child_exit(channel_id, handle, child).await;
+    Ok(())
   }
 }
 
@@ -634,12 +640,12 @@ impl russh::server::Handler for ServerHandler {
       verified_credentials: self
         .verified_credentials
         .clone()
-        .expect("shell_request called when verified_credentials is None"),
+        .context("shell_request called when verified_credentials is None")?,
       requested_environment_variables: self.requested_environment_variables.clone(),
     })?;
     self
       .gatekeeper_handle_exec_response(channel_id, &mut session, resp)
-      .await;
+      .await?;
 
     Ok((self, session))
   }
@@ -677,13 +683,13 @@ impl russh::server::Handler for ServerHandler {
       verified_credentials: self
         .verified_credentials
         .clone()
-        .expect("exec_request called when verified_credentials is None"),
+        .context("exec_request called when verified_credentials is None")?,
       requested_environment_variables: self.requested_environment_variables.clone(),
       command: command_string,
     })?;
     self
       .gatekeeper_handle_exec_response(channel_id, &mut session, resp)
-      .await;
+      .await?;
 
     Ok((self, session))
   }
