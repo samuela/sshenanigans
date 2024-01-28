@@ -16,8 +16,6 @@ categories = ["command-line-utilities", "network-programming"]
 anyhow = "*"
 async-trait = "*"
 clap = { version = "*", features = ["derive"] }
-env_logger = "*"
-log = "*"
 nix = { version = "*", features = ["user"] }
 
 # See https://github.com/doy/pty-process/pull/8#issuecomment-1829236622.
@@ -32,4 +30,6 @@ russh-keys = { git = "https://github.com/samuela/russh.git", rev = "ea64035c5049
 serde = "*"
 serde_json = "*"
 tokio = { version = "*" }
+tracing = "*"
+tracing-subscriber = { version = "*", features = ["env-filter"] }
 uuid = { version = "*", features = ["v4"] }

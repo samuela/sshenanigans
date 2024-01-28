@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use uuid::Uuid;
 
 struct AbortOnDrop {
@@ -51,6 +53,8 @@ struct PtyStuff {
 }
 
 struct ServerHandler {
+  tracing_span: tracing::Span,
+
   gatekeeper_command: PathBuf,
   gatekeeper_args: Vec<String>,
 
@@ -90,6 +94,8 @@ struct ServerHandler {
 
 impl russh::server::Server for Server {
   type Handler = ServerHandler;
+
+  #[tracing::instrument(skip(self))]
   fn new_client(&mut self, client_address: Option<SocketAddr>) -> ServerHandler {
     // Peculiar though it may be, it is possible in practice for
     // `client_address` to be `None`. This seems to trace all the way back to
@@ -100,8 +106,10 @@ impl russh::server::Server for Server {
     // See https://github.com/warp-tech/russh/issues/226.
 
     let client_id = Uuid::new_v4();
-    log::info!("[{:?}] new client, assigning id {client_id}", client_address);
     ServerHandler {
+      // No need to add client_address as a field, since this span's parent will
+      // be the one created by `tracing::instrument` on `new_client`.
+      tracing_span: tracing::span!(tracing::Level::INFO, "connection", ?client_id),
       gatekeeper_command: self.gatekeeper_command.clone(),
       gatekeeper_args: self.gatekeeper_args.clone(),
       client_id,
@@ -115,10 +123,11 @@ impl russh::server::Server for Server {
   }
 
   fn handle_session_error(&mut self, error: <Self::Handler as russh::server::Handler>::Error) {
-    log::error!("session error: {:?}", error);
+    tracing::error!(?error, "session error");
   }
 }
 
+#[tracing::instrument(skip(handle))]
 async fn close_channel(
   client_address: Option<SocketAddr>,
   client_id: Uuid,
@@ -135,35 +144,18 @@ async fn close_channel(
   };
 
   // Note: these can fail. I have no idea why.
-  if let Err(e) = handle.exit_status_request(channel_id, our_exit_status).await {
-    log::error!(
-      "[{:?} {} {}] sending exit status failed: {:?}",
-      client_address,
-      client_id,
-      channel_id,
-      e
-    );
+  if let Err(error) = handle.exit_status_request(channel_id, our_exit_status).await {
+    tracing::error!(?error, "sending exit status failed");
   }
-  if let Err(e) = handle.eof(channel_id).await {
-    log::error!(
-      "[{:?} {} {}] sending eof failed: {:?}",
-      client_address,
-      client_id,
-      channel_id,
-      e
-    );
+  if let Err(error) = handle.eof(channel_id).await {
+    tracing::error!(?error, "sending eof failed");
   }
-  if let Err(e) = handle.close(channel_id).await {
-    log::error!(
-      "[{:?} {} {}] sending close failed: {:?}",
-      client_address,
-      client_id,
-      channel_id,
-      e
-    );
+  if let Err(error) = handle.close(channel_id).await {
+    tracing::error!(?error, "sending close failed");
   }
 }
 
+#[tracing::instrument(level = "trace", skip(handle))]
 async fn send_data(
   client_address: Option<SocketAddr>,
   client_id: Uuid,
@@ -175,14 +167,8 @@ async fn send_data(
   // closing the channel before we can finish writing to it?
   //
   // TODO: debug and come up with a better solution
-  if let Err(e) = handle.data(channel_id, CryptoVec::from_slice(data)).await {
-    log::error!(
-      "[{:?} {} {}] sending data failed: {:?}",
-      client_address,
-      client_id,
-      channel_id,
-      e
-    );
+  if let Err(error) = handle.data(channel_id, CryptoVec::from_slice(data)).await {
+    tracing::error!(?error, "sending data failed");
   }
 }
 
@@ -209,6 +195,8 @@ async fn send_data(
 /// in the flow.
 impl ServerHandler {
   /// Talk to the gatekeeper and parse its response.
+  // NOTE: we don't log `request` since it can contain passwords.
+  #[tracing::instrument(level = "debug", skip(self, request))]
   fn gatekeeper_call<O: DeserializeOwned>(&self, request: RequestType) -> Result<O, anyhow::Error> {
     let start_time = std::time::Instant::now();
 
@@ -228,13 +216,7 @@ impl ServerHandler {
       .stdin(std::process::Stdio::piped())
       .stdout(std::process::Stdio::piped())
       .spawn()?;
-    // NOTE: we don't log `request` since it can contain passwords.
-    log::debug!(
-      "[{:?} {}] gatekeeper child spawned with pid: {}",
-      self.client_address,
-      self.client_id,
-      child.id()
-    );
+    tracing::debug!(pid = child.id(), "gatekeeper child spawned");
 
     // Write the details to the child's stdin.
     child
@@ -245,26 +227,23 @@ impl ServerHandler {
       .unwrap();
 
     let output = child.wait_with_output().unwrap();
-    log::debug!(
-      "[{:?} {}] gatekeeper took {:.2?}, output: {:?}",
-      self.client_address,
-      self.client_id,
-      start_time.elapsed(),
-      output
+    tracing::debug!(
+      elapsed = ?start_time.elapsed(),
+      ?output,
+      "gatekeeper finished"
     );
 
-    assert!(
-      output.status.success(),
-      "[{:?} {}] gatekeeper exited with a non-zero status code: {:?}",
-      self.client_address,
-      self.client_id,
-      output.status.code().unwrap()
-    );
-
-    serde_json::from_slice(&output.stdout).context("Failed to parse gatekeeper stdout")
+    let exit_status = output.status;
+    if exit_status.success() {
+      serde_json::from_slice(&output.stdout).context("Failed to parse gatekeeper stdout")
+    } else {
+      anyhow::bail!("The Gatekeeper exited with a non-zero status code, {exit_status}. The Gatekeeper should never exit with a non-zero status code, even when rejecting requests.");
+    }
   }
 
   /// Send an auth request to the gatekeeper and parse its response.
+  // NOTE: we don't log `unverified_credentials` since it can contain passwords.
+  #[tracing::instrument(level = "debug", skip(self, unverified_credentials))]
   fn gatekeeper_make_auth_request(
     self,
     unverified_credentials: &Credentials,
@@ -277,11 +256,7 @@ impl ServerHandler {
 
     Ok(match response {
       AuthResponse { accept: true, .. } => {
-        log::info!(
-          "[{:?} {}] received {{ accept: true }} from gatekeeper",
-          self.client_address,
-          self.client_id,
-        );
+        tracing::info!("gatekeeper accepted auth request");
         (
           Self {
             verified_credentials: Some(unverified_credentials.clone()),
@@ -295,12 +270,7 @@ impl ServerHandler {
         proceed_with_methods,
         ..
       } => {
-        log::info!(
-          "[{:?} {}] received {{ accept: false, proceed_with_methods: {:?} }} from gatekeeper",
-          self.client_address,
-          self.client_id,
-          proceed_with_methods
-        );
+        tracing::info!(?proceed_with_methods, "gatekeeper rejected auth request");
         (
           Self {
             verified_credentials: None,
@@ -320,6 +290,7 @@ impl ServerHandler {
     })
   }
 
+  #[tracing::instrument(level = "debug", skip(self, session, response))]
   async fn gatekeeper_handle_exec_response(
     &self,
     channel_id: ChannelId,
@@ -328,7 +299,7 @@ impl ServerHandler {
   ) -> Result<(), <Self as russh::server::Handler>::Error> {
     match response.accept {
       Some(cmd) => {
-        log::debug!("gatekeeper accepted exec request");
+        tracing::debug!("gatekeeper accepted exec request");
 
         let handle = session.handle();
         match self.ptys.lock().await.get(&channel_id) {
@@ -337,7 +308,8 @@ impl ServerHandler {
         }
       }
       None => {
-        log::debug!("gatekeeper rejected exec request");
+        tracing::debug!("gatekeeper rejected exec request");
+
         session.eof(channel_id);
         session.close(channel_id);
       }
@@ -349,6 +321,7 @@ impl ServerHandler {
   /// ownership of the child process to the task, and add an `AbortHandle` for
   /// the task to `self.child_abort_handles`. This is necessary to prevent
   /// leaking processes.
+  #[tracing::instrument(level = "debug", skip(self, handle, child), fields(child_pid = child.id().unwrap()))]
   async fn close_channel_on_child_exit(
     &self,
     channel_id: ChannelId,
@@ -368,6 +341,9 @@ impl ServerHandler {
   }
 
   /// Execute a command in a given PTY. Upon exit, close the SSH channel.
+  // `command_spec` tends to be quite verbose and can possibly contain secrets,
+  // so we don't log it.
+  #[tracing::instrument(level = "debug", skip(self, handle, pty_stuff, command_spec))]
   async fn pty_exec(
     &self,
     channel_id: ChannelId,
@@ -389,13 +365,7 @@ impl ServerHandler {
           .gid(command_spec.gid)
           .spawn(&pty_stuff.pts)
           .context("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.")?;
-    log::info!(
-      "[{:?} {} {}] child spawned with pid: {}",
-      self.client_address,
-      self.client_id,
-      channel_id,
-      child.id().unwrap()
-    );
+    tracing::info!(pid = child.id(), "child spawned");
 
     // Notes:
     // 1. We already set up a task to read from the PTY and send to the SSH
@@ -405,11 +375,11 @@ impl ServerHandler {
     //    is spawned on macOS. See https://github.com/doy/pty-process/issues/7#issuecomment-1826196215
     //    and https://github.com/pkgw/stund/issues/305.
     // 3. `pty_process::Size::new` flips the order of col_width and row_height!
-    if let Err(e) = pty_stuff.pty_writer.resize(pty_process::Size::new(
+    if let Err(error) = pty_stuff.pty_writer.resize(pty_process::Size::new(
       pty_stuff.requested_row_height,
       pty_stuff.requested_col_width,
     )) {
-      log::error!("pty.resize failed: {:?}", e);
+      tracing::error!(?error, "pty.resize failed");
     }
 
     self.close_channel_on_child_exit(channel_id, handle, child).await;
@@ -417,6 +387,7 @@ impl ServerHandler {
   }
 
   /// Execute a command without a PTY.
+  #[tracing::instrument(level = "debug", skip(self, handle, command_spec))]
   async fn non_pty_exec(
     &self,
     channel_id: ChannelId,
@@ -439,13 +410,7 @@ impl ServerHandler {
           .stderr(std::process::Stdio::piped())
           .spawn()
           .context("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.")?;
-    log::info!(
-      "[{:?} {} {}] child spawned with pid: {}",
-      self.client_address,
-      self.client_id,
-      channel_id,
-      child.id().unwrap(),
-    );
+    tracing::info!(pid = child.id(), "child spawned");
 
     // Add stdin to our stdin_writers `HashMap` so that we can write to it later in `data`
     let stdin = child.stdin.take().unwrap();
@@ -487,24 +452,16 @@ impl ServerHandler {
 impl russh::server::Handler for ServerHandler {
   type Error = anyhow::Error;
 
+  #[tracing::instrument(parent = &self.tracing_span, skip(self))]
   async fn auth_none(self, username: &str) -> Result<(Self, Auth), Self::Error> {
-    log::info!(
-      "[{:?} {}] auth_none: username: {username}",
-      self.client_address,
-      self.client_id
-    );
     self.gatekeeper_make_auth_request(&Credentials {
       username: username.to_owned(),
       method: CredentialsType::None,
     })
   }
 
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, password))]
   async fn auth_password(self, username: &str, password: &str) -> Result<(Self, Auth), Self::Error> {
-    log::info!(
-      "[{:?} {}] auth_password: username: {username}",
-      self.client_address,
-      self.client_id
-    );
     self.gatekeeper_make_auth_request(&Credentials {
       username: username.to_owned(),
       method: CredentialsType::Password {
@@ -513,6 +470,8 @@ impl russh::server::Handler for ServerHandler {
     })
   }
 
+  // `public_key` Debug prints in a format that is basically worthless.
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, public_key))]
   async fn auth_publickey(
     self,
     username: &str,
@@ -520,7 +479,7 @@ impl russh::server::Handler for ServerHandler {
   ) -> Result<(Self, Auth), Self::Error> {
     let public_key_algorithm = public_key.name().to_owned();
     let public_key_base64 = public_key.public_key_base64();
-    log::info!("[{:?} {}] auth_publickey: username: {username} public_key_algorithm: {public_key_algorithm} public_key_base64: {public_key_base64}", self.client_address, self.client_id);
+    tracing::info!(public_key_algorithm, public_key_base64);
     self.gatekeeper_make_auth_request(&Credentials {
       username: username.to_owned(),
       method: CredentialsType::PublicKey {
@@ -531,33 +490,27 @@ impl russh::server::Handler for ServerHandler {
   }
 
   // Not a lot of logic here, but russh requires this handler.
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn channel_open_session(
     self,
-    channel: Channel<Msg>,
+    _channel: Channel<Msg>,
     session: Session,
   ) -> Result<(Self, bool, Session), Self::Error> {
-    log::info!(
-      "[{:?} {} {}] channel_open_session",
-      self.client_address,
-      self.client_id,
-      channel.id()
-    );
     Ok((self, true, session))
   }
 
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn pty_request(
     self,
     channel_id: ChannelId,
     term: &str,
     col_width: u32,
     row_height: u32,
-    pix_width: u32,
-    pix_height: u32,
+    _pix_width: u32,
+    _pix_height: u32,
     modes: &[(russh::Pty, u32)],
     session: Session,
   ) -> Result<(Self, Session), Self::Error> {
-    log::info!("[{:?} {} {}] pty_request, channel_id: {channel_id}, term: {term}, col_width: {col_width}, row_height: {row_height}, pix_width: {pix_width}, pix_height: {pix_height}, modes: {modes:?}", self.client_address, self.client_id, channel_id);
-
     // TODO: We're currently ignoring the requested modes. We should probably do something with them.
 
     let pty = pty_process::Pty::new().unwrap();
@@ -602,20 +555,14 @@ impl russh::server::Handler for ServerHandler {
     Ok((self, session))
   }
 
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn env_request(
     self,
-    channel: ChannelId,
+    _channel: ChannelId,
     variable_name: &str,
     variable_value: &str,
     session: Session,
   ) -> Result<(Self, Session), Self::Error> {
-    log::info!(
-      "[{:?} {} {}] env_request: {variable_name}={variable_value}",
-      self.client_address,
-      self.client_id,
-      channel,
-    );
-
     let mut env = self.requested_environment_variables;
     env.insert(variable_name.to_owned(), variable_value.to_owned());
 
@@ -628,14 +575,8 @@ impl russh::server::Handler for ServerHandler {
     ))
   }
 
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn shell_request(self, channel_id: ChannelId, mut session: Session) -> Result<(Self, Session), Self::Error> {
-    log::info!(
-      "[{:?} {} {}] shell_request",
-      self.client_address,
-      self.client_id,
-      channel_id
-    );
-
     let resp: ExecResponse = self.gatekeeper_call(RequestType::Shell {
       verified_credentials: self
         .verified_credentials
@@ -651,20 +592,22 @@ impl russh::server::Handler for ServerHandler {
   }
 
   /// SSH client sends data, pipe it to the corresponding PTY or stdin
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn data(self, channel_id: ChannelId, data: &[u8], session: Session) -> Result<(Self, Session), Self::Error> {
     if let Some(PtyStuff { pty_writer, .. }) = self.ptys.lock().await.get_mut(&channel_id) {
-      log::debug!("pty_writer: data = {data:02x?}");
+      tracing::debug!(?data, "writing to pty_writer");
       pty_writer.write_all(data).await.unwrap();
     } else if let Some(stdin_writer) = self.stdin_writers.lock().await.get_mut(&channel_id) {
-      log::debug!("stdin_writer: data = {data:02x?}");
+      tracing::debug!(?data, "writing to stdin_writer");
       stdin_writer.write_all(data).await.unwrap();
     } else {
-      log::warn!("could not find outlet for data from {channel_id}, skipping write")
+      tracing::warn!("could not find outlet for data, skipping write");
     }
 
     Ok((self, session))
   }
 
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, session, command))]
   async fn exec_request(
     self,
     channel_id: ChannelId,
@@ -672,12 +615,7 @@ impl russh::server::Handler for ServerHandler {
     mut session: Session,
   ) -> Result<(Self, Session), Self::Error> {
     let command_string = String::from_utf8(command.to_vec())?;
-    log::info!(
-      "[{:?} {} {}] exec_request: command: {command_string}",
-      self.client_address,
-      self.client_id,
-      channel_id
-    );
+    tracing::info!(?command_string);
 
     let resp: ExecResponse = self.gatekeeper_call(RequestType::Exec {
       verified_credentials: self
@@ -695,35 +633,29 @@ impl russh::server::Handler for ServerHandler {
   }
 
   /// The client's pseudo-terminal window size has changed.
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn window_change_request(
     self,
     channel_id: ChannelId,
     col_width: u32,
     row_height: u32,
-    pix_width: u32,
-    pix_height: u32,
+    _pix_width: u32,
+    _pix_height: u32,
     session: Session,
   ) -> Result<(Self, Session), Self::Error> {
-    log::info!("[{:?} {} {}] window_change_request col_width = {col_width} row_height = {row_height}, pix_width = {pix_width}, pix_height = {pix_height}", self.client_address, self.client_id, channel_id);
     if let Some(PtyStuff { pty_writer, .. }) = self.ptys.lock().await.get_mut(&channel_id) {
-      if let Err(e) = pty_writer.resize(pty_process::Size::new(row_height as u16, col_width as u16)) {
-        log::error!("pty.resize failed: {:?}", e);
+      if let Err(error) = pty_writer.resize(pty_process::Size::new(row_height as u16, col_width as u16)) {
+        tracing::error!(?error, "pty.resize failed");
       }
     } else {
-      log::warn!("ptys doesn't contain channel_id: {channel_id}, skipping pty resize")
+      tracing::warn!("ptys doesn't contain channel_id, skipping pty resize");
     }
 
     Ok((self, session))
   }
 
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn channel_close(self, channel_id: ChannelId, session: Session) -> Result<(Self, Session), Self::Error> {
-    log::info!(
-      "[{:?} {} {}] channel_close",
-      self.client_address,
-      self.client_id,
-      channel_id
-    );
-
     // Removing from `self.child_abort_handles` and dropping results in the
     // corresponding child process being killed. This is important since we
     // don't want to leak processes. Child processes will be killed since
@@ -766,16 +698,16 @@ struct Args {
 
 fn load_host_keys(host_key_paths: Vec<PathBuf>) -> Vec<russh_keys::key::KeyPair> {
   if host_key_paths.is_empty() {
-    log::error!("At least one --host-key-path is required");
+    tracing::error!("At least one --host-key-path is required");
     std::process::exit(1);
   }
 
   host_key_paths
     .iter()
     .map(|path| {
-      // NOTE: we don't support encrypted keys
-      russh_keys::load_secret_key(path, None).unwrap_or_else(|err| {
-        log::error!("Failed to load host key {}: {err:?}", path.to_string_lossy());
+      // NOTE: we don't support encrypted keys or "~/foo" paths yet.
+      russh_keys::load_secret_key(path, None).unwrap_or_else(|error| {
+        tracing::error!(?path, ?error, "Failed to load host key");
         std::process::exit(1);
       })
     })
@@ -783,11 +715,18 @@ fn load_host_keys(host_key_paths: Vec<PathBuf>) -> Vec<russh_keys::key::KeyPair>
 }
 
 #[tokio::main]
-async fn main() {
-  env_logger::builder().init();
+async fn main() -> Result<(), anyhow::Error> {
+  tracing_subscriber::registry()
+    .with(
+      tracing_subscriber::fmt::layer()
+        .pretty()
+        // Use span events to automatically log each of the SSH handlers.
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW),
+    )
+    .with(tracing_subscriber::EnvFilter::from_default_env())
+    .init();
 
   let args = Args::parse();
-  log::info!("args: {:?}", args);
 
   let gatekeeper_split = args.gatekeeper.split_whitespace().collect::<Vec<&str>>();
   assert!(!gatekeeper_split.is_empty(), "gatekeeper command must not be empty");
@@ -799,22 +738,23 @@ async fn main() {
     ..Default::default()
   };
 
-  let socket = tokio::net::TcpListener::bind(&args.listen)
-    .await
-    .expect("Failed to bind to socket. Are you sure you have permissions to bind to the given socket address?");
+  let socket = tokio::net::TcpListener::bind(&args.listen).await.context(format!(
+    "Failed to bind to socket {}. Are you sure you have permissions to bind to the given socket address?",
+    args.listen
+  ))?;
 
   // setgid before setuid, since generally speaking we won't have permission to
   // setgid after setuid.
   if let Some(gid) = args.setgid {
-    log::info!("Dropping privileges to gid {}", gid);
-    nix::unistd::setgid(nix::unistd::Gid::from_raw(gid)).expect("failed to drop privileges with setgid");
+    tracing::info!(gid, "dropping gid privileges");
+    nix::unistd::setgid(nix::unistd::Gid::from_raw(gid)).context("failed to drop privileges with setgid")?;
   }
   if let Some(uid) = args.setuid {
-    log::info!("Dropping privileges to uid {}", uid);
-    nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)).expect("failed to drop privileges with setuid");
+    tracing::info!(uid, "dropping uid privileges");
+    nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)).context("failed to drop privileges with setuid")?;
   }
 
-  log::info!("Listening on {}", args.listen);
+  tracing::info!(listening_on = args.listen.to_string(), "listening on socket");
   russh::server::run_on_socket(
     Arc::new(config),
     &socket,
@@ -825,5 +765,7 @@ async fn main() {
     },
   )
   .await
-  .expect("failed to run SSH server main loop");
+  .context("Failed to run SSH server main loop")?;
+
+  Ok(())
 }
