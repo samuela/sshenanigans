@@ -261,7 +261,7 @@ impl ServerHandler {
       output.status.code().unwrap()
     );
 
-    Ok(serde_json::from_slice(&output.stdout).context("Failed to parse gatekeeper stdout")?)
+    serde_json::from_slice(&output.stdout).context("Failed to parse gatekeeper stdout")
   }
 
   /// Send an auth request to the gatekeeper and parse its response.
@@ -355,8 +355,8 @@ impl ServerHandler {
     handle: russh::server::Handle,
     mut child: tokio::process::Child,
   ) {
-    let client_address_ = self.client_address.clone();
-    let client_id_ = self.client_id.clone();
+    let client_address_ = self.client_address;
+    let client_id_ = self.client_id;
     self.child_abort_handles.lock().await.insert(
       channel_id,
       AbortOnDrop::new(tokio::spawn(async move {
@@ -454,8 +454,8 @@ impl ServerHandler {
     // Read bytes from the child stdout and send them to the SSH client
     let mut stdout = child.stdout.take().unwrap();
     let handle_ = handle.clone();
-    let client_address_ = self.client_address.clone();
-    let client_id_ = self.client_id.clone();
+    let client_address_ = self.client_address;
+    let client_id_ = self.client_id;
     tokio::spawn(async move {
       let mut buffer = vec![0; 1024];
       while let Ok(n) = stdout.read(&mut buffer).await {
