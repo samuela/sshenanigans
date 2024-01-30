@@ -595,7 +595,7 @@ impl russh::server::Handler for ServerHandler {
   }
 
   /// SSH client sends data, pipe it to the corresponding PTY or stdin
-  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, session), level = "trace")]
   async fn data(self, channel_id: ChannelId, data: &[u8], session: Session) -> Result<(Self, Session), Self::Error> {
     if let Some(PtyStuff { pty_writer, .. }) = self.ptys.lock().await.get_mut(&channel_id) {
       tracing::debug!(?data, "writing to pty_writer");
