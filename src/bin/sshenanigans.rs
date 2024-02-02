@@ -611,7 +611,7 @@ impl russh::server::Handler for ServerHandler {
           ref mut _child_abort_handle,
           stuff,
         } => {
-          let handle = self.pty_exec(channel_id, handle, &stuff, &accept).await?;
+          let handle = self.pty_exec(channel_id, handle, stuff, &accept).await?;
           *_child_abort_handle = Some(handle);
         }
         _ => bail!("expected Uninitialized or PtyExec channel"),
@@ -684,7 +684,7 @@ impl russh::server::Handler for ServerHandler {
           ref mut _child_abort_handle,
           stuff,
         } => {
-          let handle = self.pty_exec(channel_id, handle, &stuff, &accept).await?;
+          let handle = self.pty_exec(channel_id, handle, stuff, &accept).await?;
           *_child_abort_handle = Some(handle);
         }
         _ => bail!("expected Uninitialized or PtyExec channel"),
