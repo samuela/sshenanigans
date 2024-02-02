@@ -33,6 +33,13 @@ pub enum RequestType {
     requested_environment_variables: HashMap<String, String>,
     command: String,
   },
+  LocalPortForward {
+    verified_credentials: Credentials,
+    host_to_connect: String,
+    port_to_connect: u32,
+    originator_address: String,
+    originator_port: u32,
+  },
 }
 
 #[derive(Serialize)]

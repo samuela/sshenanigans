@@ -78,8 +78,9 @@ struct SshenanigansChannel {
 /// Note that we can't actually own the `Child` in these since `child.wait()`,
 /// takes ownership.
 enum SshenanigansChannelState {
-  /// Every channel starts out life as an `Uninitialized` channel in
-  /// `channel_open_session`.
+  /// A channel starts out life as an `Uninitialized` channel when opened via
+  /// `channel_open_session`. Note that some channels may start life directly,
+  /// eg `LocalPortForward`.
   Uninitialized,
 
   /// An `Uninitialized` channel is converted into `PtyExec` channel in
@@ -92,6 +93,16 @@ enum SshenanigansChannelState {
   /// An `Uninitialized` channel is converted into a `NonPtyExec` channel by
   /// `shell_request` or `exec_request` that is not preceded by a `pty_request`.
   NonPtyExec {
+    _child_abort_handle: AbortOnDrop,
+    stdin_writer: tokio::process::ChildStdin,
+  },
+
+  /// A channel dedicated to local port forwarding, commonly initiated on the
+  /// client with eg `ssh -L 8080:localhost:8080 bitbop.io`. This channel is
+  /// logically a TCP byte stream such that bytes received and sent over the
+  /// channel correspond one-to-one with TCP bytes received and sent over the
+  /// local port on the client.
+  LocalPortForward {
     _child_abort_handle: AbortOnDrop,
     stdin_writer: tokio::process::ChildStdin,
   },
@@ -632,16 +643,22 @@ impl russh::server::Handler for ServerHandler {
           stuff: PtyStuff { ref mut pty_writer, .. },
           ..
         } => {
-          tracing::trace!(?data, "writing to pty_writer");
+          tracing::trace!(?data, "writing to PtyExec");
           pty_writer.write_all(data).await.context("Failed to write to PTY")?;
         }
         SshenanigansChannelState::NonPtyExec {
           ref mut stdin_writer, ..
         } => {
-          tracing::trace!(?data, "writing to stdin_writer");
+          tracing::trace!(?data, "writing to NonPtyExec");
           stdin_writer.write_all(data).await.context("Failed to write to stdin")?;
         }
-        _ => bail!("expected PtyExec or NonPtyExec channel"),
+        SshenanigansChannelState::LocalPortForward {
+          ref mut stdin_writer, ..
+        } => {
+          tracing::trace!(?data, "writing to LocalPortForward");
+          stdin_writer.write_all(data).await.context("failed to write to stdin")?;
+        }
+        _ => bail!("expected PtyExec, NonPtyExec, or LocalPortForward channel"),
       }
     }
     Ok((self, session))
@@ -729,6 +746,109 @@ impl russh::server::Handler for ServerHandler {
     // `tokio::process::Child`s that have `kill_on_drop(true)` set.
     drop(self.channels.remove(&channel_id));
     Ok((self, session))
+  }
+
+  /// Arguments are such that on the client this looks like:
+  ///
+  ///   ssh -L 8080:<host_to_connect>:<port_to_connect> bitbop.io
+  ///
+  /// originator_address and originator_port do not seem to be interesting. The
+  /// "local port", 8080 in this example, is not revealed to the server.
+  ///
+  /// Upon receiving a new connection to the local socket, the client will send
+  /// a `direct-tcpip` message. russh starts a fresh channel (accessed via the
+  /// `channel` argument), bypassing `channel_open_session`. This process is
+  /// repeated for each new connection to the client socket.
+  ///
+  /// You can exercise this endpoint by running
+  ///
+  ///   ssh -L 8080:localhost:8080 bitbop.io -N
+  ///
+  /// and then `curl localhost:8080` on the client. Both are necessary since
+  /// most clients will not invoke `channel_open_direct_tcpip` until a
+  /// connection is made to their local socket.
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
+  async fn channel_open_direct_tcpip(
+    self,
+    channel: Channel<Msg>,
+    host_to_connect: &str,
+    port_to_connect: u32,
+    originator_address: &str,
+    originator_port: u32,
+    session: Session,
+  ) -> Result<(Self, bool, Session), Self::Error> {
+    let channel_id = channel.id();
+    {
+      let verified_credentials = self
+        .verified_credentials
+        .clone()
+        .context("expected verified_credentials")?;
+      let resp: ExecResponse = self.gatekeeper_call(RequestType::LocalPortForward {
+        verified_credentials,
+        host_to_connect: host_to_connect.to_owned(),
+        port_to_connect,
+        originator_address: originator_address.to_owned(),
+        originator_port,
+      })?;
+      // We are expected to return Ok((_, false, _)) when rejecting the request,
+      // in contrast to most of the other handlers.
+      let accept: ExecResponseAccept = match resp.accept {
+        Some(x) => x,
+        None => return Ok((self, false, session)),
+      };
+
+      let mut child = tokio::process::Command::new(&accept.command)
+          // Security critial: Use `env_clear()` so we don't inherit environment
+          // variables from the parent process.
+          .env_clear()
+          // kill_on_drop(true) is essential to prevent leaking processes.
+          .kill_on_drop(true)
+          .args(&accept.arguments)
+          .current_dir(&accept.working_directory)
+          .uid(accept.uid)
+          .gid(accept.gid)
+          .stdin(std::process::Stdio::piped())
+          .stdout(std::process::Stdio::piped())
+          .stderr(std::process::Stdio::inherit())
+          .spawn()
+          .context("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.")?;
+      tracing::info!(pid = child.id(), "child spawned");
+
+      // Read bytes from the child stdout and send them to the SSH client
+      let mut stdout = child.stdout.take().context("Failed to get stdout for child process")?;
+      let handle_ = session.handle().clone();
+      let client_address_ = self.client_address;
+      let client_id_ = self.client_id;
+      tokio::spawn(async move {
+        let mut buffer = vec![0; 1024];
+        while let Ok(n) = stdout.read(&mut buffer).await {
+          if n == 0 {
+            break;
+          }
+          send_data(client_address_, client_id_, channel_id, &handle_, &buffer[0..n]).await;
+        }
+      });
+
+      let stdin = child.stdin.take().context("Failed to get stdin for child process")?;
+      // Note: we would like to `wait_and_close_channel` as early as possible in
+      // case of Err short-circuiting the function, but it consumes ownership of
+      // `child`.
+      let handle = session.handle().clone();
+      let wait_handle = self.wait_and_close_channel(channel_id, handle, child).await;
+
+      self.channels.insert(
+        channel_id,
+        SshenanigansChannel {
+          requested_environment_variables: HashMap::new(),
+          state: SshenanigansChannelState::LocalPortForward {
+            _child_abort_handle: wait_handle,
+            stdin_writer: stdin,
+          },
+        },
+      );
+    }
+
+    Ok((self, true, session))
   }
 }
 

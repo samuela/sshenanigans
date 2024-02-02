@@ -12,7 +12,9 @@ Features:
 
 ## Gatekeeper API
 
-There are three types of requests sent to The Gatekeeper: `Auth`, `Shell`, and `Exec`. The Gatekeeper will receive one request per invocation. The Gatekeeper should exit with status zero in nominal operation, even when rejecting requests. Exiting in a non-zero status code will cause sshenanigans to produce an error and reject the request.
+There are four types of requests sent to The Gatekeeper: `Auth`, `Shell`, `Exec`, and `LocalPortForward`. The Gatekeeper will receive one request per invocation. The Gatekeeper should exit with status zero in nominal operation, even when rejecting requests. Exiting in a non-zero status code will cause sshenanigans to produce an error and reject the request.
+
+The Gatekeeper may implement handling for any subset of the request types, but should always terminate. A malformed or missing response will be interpreted as a rejection of the request by sshenanigans.
 
 Every request includes `client_address` and `client_id` fields. `client_address` is the IP address and port of the client. `client_id` is a unique identifier for the client and can be useful for tracking a client across multiple requests. Note however that a single user or machine may maintain multiple connections, each with their own `client_id`, in the same way that you may have multiple browser tabs connected to the same website.
 
@@ -129,6 +131,28 @@ This request is commonly triggered by invoking SSH with a command, eg. `ssh user
 ```
 
 And responses follow the same structure as for `Shell` requests.
+
+### `LocalPortForward` requests
+
+This request is commonly triggered by invoking SSH with a local port forward, eg. `ssh -L 8080:localhost:8080 user@host`. Specifically, this request is triggered upon receiving a `direct-tcpip` SSH message from the client, per [RFC 4254 Sec. 7.2](https://datatracker.ietf.org/doc/html/rfc4254#autoid-25). In this case, the request will take the form
+
+```json
+{
+  "client_address": "174.168.101.116:60531",
+  "client_id": "bf001b29-29e1-4754-be0c-37810b6fc703",
+  "request": {
+    "LocalPortForward": {
+      "verified_credentials": { "username": "sam", "method": "None" },
+      "host_to_connect": "localhost",
+      "port_to_connect": 8888,
+      "originator_address": "::1",
+      "originator_port": 60548
+    }
+  }
+}
+```
+
+And responses follow the same structure as for `Shell` and `Exec` requests. If sshenanigans receives an approval response, it will spawn a process as specified by the response. sshenanigans will send TCP bytes received from the client to the process's stdin, and will send TCP bytes received from the process's stdout to the client.
 
 ## Getting started
 
