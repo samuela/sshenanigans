@@ -1,6 +1,7 @@
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use clap::Parser;
+use dashmap::DashMap;
 use pty_process::OwnedWritePty;
 use russh::server::{Auth, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec, MethodSet};
@@ -16,7 +17,6 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use uuid::Uuid;
@@ -113,7 +113,7 @@ struct ServerHandler {
   /// authentication.
   verified_credentials: Option<Credentials>,
 
-  channels: Arc<Mutex<HashMap<ChannelId, SshenanigansChannel>>>,
+  channels: Arc<DashMap<ChannelId, SshenanigansChannel>>,
 }
 
 impl russh::server::Server for Server {
@@ -139,7 +139,7 @@ impl russh::server::Server for Server {
       client_id,
       client_address,
       verified_credentials: None,
-      channels: Arc::new(Mutex::new(HashMap::new())),
+      channels: Arc::new(DashMap::new()),
     }
   }
 
@@ -489,7 +489,7 @@ impl russh::server::Handler for ServerHandler {
     session: Session,
   ) -> Result<(Self, bool, Session), Self::Error> {
     // Note: We don't guard against clobbering an existing channel id.
-    self.channels.lock().await.insert(
+    self.channels.insert(
       channel.id(),
       SshenanigansChannel {
         requested_environment_variables: HashMap::new(),
@@ -512,8 +512,7 @@ impl russh::server::Handler for ServerHandler {
     session: Session,
   ) -> Result<(Self, Session), Self::Error> {
     {
-      let mut channels = self.channels.lock().await;
-      let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
+      let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
       match channel.state {
         SshenanigansChannelState::Uninitialized => {
           // TODO: We're currently ignoring the requested modes. We should
@@ -576,8 +575,7 @@ impl russh::server::Handler for ServerHandler {
     session: Session,
   ) -> Result<(Self, Session), Self::Error> {
     {
-      let mut channels = self.channels.lock().await;
-      let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
+      let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
       channel
         .requested_environment_variables
         .insert(variable_name.to_owned(), variable_value.to_owned());
@@ -588,8 +586,7 @@ impl russh::server::Handler for ServerHandler {
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn shell_request(self, channel_id: ChannelId, session: Session) -> Result<(Self, Session), Self::Error> {
     {
-      let mut channels = self.channels.lock().await;
-      let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
+      let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
 
       let resp: ExecResponse = self.gatekeeper_call(RequestType::Shell {
         verified_credentials: self
@@ -628,8 +625,7 @@ impl russh::server::Handler for ServerHandler {
   async fn data(self, channel_id: ChannelId, data: &[u8], session: Session) -> Result<(Self, Session), Self::Error> {
     tracing::trace!(data_utf8 = ?String::from_utf8_lossy(data));
     {
-      let mut channels = self.channels.lock().await;
-      let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
+      let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
       match channel.state {
         SshenanigansChannelState::PtyExec {
           stuff: PtyStuff { ref mut pty_writer, .. },
@@ -661,8 +657,7 @@ impl russh::server::Handler for ServerHandler {
     tracing::info!(?command_string);
 
     {
-      let mut channels = self.channels.lock().await;
-      let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
+      let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
 
       let resp: ExecResponse = self.gatekeeper_call(RequestType::Exec {
         verified_credentials: self
@@ -708,8 +703,7 @@ impl russh::server::Handler for ServerHandler {
     session: Session,
   ) -> Result<(Self, Session), Self::Error> {
     {
-      let mut channels = self.channels.lock().await;
-      let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
+      let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
       match channel.state {
         SshenanigansChannelState::PtyExec {
           stuff: PtyStuff { ref mut pty_writer, .. },
@@ -731,7 +725,7 @@ impl russh::server::Handler for ServerHandler {
     // killed since their associated channel struct will contain `AbortOnDrop`s
     // which contain `tokio::task::AbortHandle`s for tokio tasks that own
     // `tokio::process::Child`s that have `kill_on_drop(true)` set.
-    drop(self.channels.lock().await.remove(&channel_id));
+    drop(self.channels.remove(&channel_id));
     Ok((self, session))
   }
 }
