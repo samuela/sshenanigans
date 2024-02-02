@@ -42,14 +42,51 @@ struct Server {
   gatekeeper_args: Vec<String>,
 }
 
-type ChannelValue<T> = Arc<Mutex<HashMap<ChannelId, T>>>;
-
-/// The requested PTY size (col, row), PTS, and writer to the PTY.
 struct PtyStuff {
   requested_col_width: u16,
   requested_row_height: u16,
   pts: pty_process::Pts,
   pty_writer: OwnedWritePty,
+}
+
+/// A type representing the state of a channel. `ServerHandler` is a state
+/// machine that transitions between these states as the SSH client sends
+/// requests.
+///
+/// For each channel, a handle that when dropped will abort a tokio task
+/// owning the corresponding child process for that channel. This is necessary
+/// to prevent process leakage. There are two ways these Droppings come in
+/// handy:
+/// 1. We manually drop these in `close_channel` to kill the child process.
+/// 2. `ServerHandler` will be dropped when the SSH client disconnects,
+///    cleanly or not. This can happen eg when the inactivity timeout
+///    threshold is violated. When this happens, the `ServerHandler` will be
+///    dropped (https://github.com/warp-tech/russh/issues/229), which will
+///    drop all `AbortOnDrop`s, which will abort their corresponding tokio
+///    tasks, each of which own a `tokio::process::Child` process. These
+///    children have `kill_on_drop(true)` set, so they will be killed by tokio
+///    automatically.
+///
+/// Note that we can't actually own the `Child` in these since `child.wait()`,
+/// takes ownership.
+enum SshenanigansChannel {
+  /// Every channel starts out life as an `Uninitialized` channel in
+  /// `channel_open_session`.
+  Uninitialized,
+
+  /// An `Uninitialized` channel is converted into `PtyExec` channel in
+  /// `pty_request`.
+  PtyExec {
+    _child_abort_handle: Option<AbortOnDrop>,
+    stuff: PtyStuff,
+  },
+
+  /// An `Uninitialized` channel is converted into a `NonPtyExec` channel by
+  /// `shell_request` or `exec_request` that is not preceded by a `pty_request`.
+  NonPtyExec {
+    _child_abort_handle: AbortOnDrop,
+    stdin_writer: tokio::process::ChildStdin,
+  },
 }
 
 struct ServerHandler {
@@ -71,25 +108,7 @@ struct ServerHandler {
   /// Environment variables requested by the client via `env_request`.
   requested_environment_variables: HashMap<String, String>,
 
-  ptys: ChannelValue<PtyStuff>,
-
-  /// Writer to the stdin of the child process associated with a channel.
-  stdin_writers: ChannelValue<tokio::process::ChildStdin>,
-
-  /// For each channel, a handle that when dropped will abort a tokio task
-  /// owning the corresponding child process for that channel. This is necessary
-  /// to prevent process leakage. There are two ways these Droppings come in
-  /// handy:
-  /// 1. We manually drop these in `close_channel` to kill the child process.
-  /// 2. `ServerHandler` will be dropped when the SSH client disconnects,
-  ///    cleanly or not. This can happen eg when the inactivity timeout
-  ///    threshold is violated. When this happens, the `ServerHandler` will be
-  ///    dropped (https://github.com/warp-tech/russh/issues/229), which will
-  ///    drop all `AbortOnDrop`s, which will abort their corresponding tokio
-  ///    tasks, each of which own a `tokio::process::Child` process. These
-  ///    children have `kill_on_drop(true)` set, so they will be killed by tokio
-  ///    automatically.
-  child_abort_handles: ChannelValue<AbortOnDrop>,
+  channels: Arc<Mutex<HashMap<ChannelId, SshenanigansChannel>>>,
 }
 
 impl russh::server::Server for Server {
@@ -116,9 +135,7 @@ impl russh::server::Server for Server {
       client_address,
       verified_credentials: None,
       requested_environment_variables: HashMap::new(),
-      ptys: Arc::new(Mutex::new(HashMap::new())),
-      stdin_writers: Arc::new(Mutex::new(HashMap::new())),
-      child_abort_handles: Arc::new(Mutex::new(HashMap::new())),
+      channels: Arc::new(Mutex::new(HashMap::new())),
     }
   }
 
@@ -293,54 +310,23 @@ impl ServerHandler {
     })
   }
 
-  #[tracing::instrument(level = "debug", skip(self, session, response))]
-  async fn gatekeeper_handle_exec_response(
-    &self,
-    channel_id: ChannelId,
-    session: &mut Session,
-    response: ExecResponse,
-  ) -> Result<(), <Self as russh::server::Handler>::Error> {
-    match response.accept {
-      Some(cmd) => {
-        tracing::debug!("gatekeeper accepted exec request");
-
-        let handle = session.handle();
-        match self.ptys.lock().await.get(&channel_id) {
-          Some(pty_stuff) => self.pty_exec(channel_id, handle, pty_stuff, &cmd).await?,
-          None => self.non_pty_exec(channel_id, handle, &cmd).await?,
-        }
-      }
-      None => {
-        tracing::debug!("gatekeeper rejected exec request");
-
-        session.eof(channel_id);
-        session.close(channel_id);
-      }
-    }
-    Ok(())
-  }
-
-  /// Spawn a task to close the SSH channel when the child process exits. Move
-  /// ownership of the child process to the task, and add an `AbortHandle` for
-  /// the task to `self.child_abort_handles`. This is necessary to prevent
-  /// leaking processes.
+  /// Spawn a task to wait on the child process and then close the SSH channel
+  /// with the exit code. Move ownership of the child process to the task, and
+  /// return an `AbortOnDrop` handle to the task.
   #[tracing::instrument(level = "debug", skip(self, handle, child), fields(child_pid = child.id().unwrap()))]
-  async fn close_channel_on_child_exit(
+  async fn wait_and_close_channel(
     &self,
     channel_id: ChannelId,
     handle: russh::server::Handle,
     mut child: tokio::process::Child,
-  ) {
+  ) -> AbortOnDrop {
     let client_address_ = self.client_address;
     let client_id_ = self.client_id;
-    self.child_abort_handles.lock().await.insert(
-      channel_id,
-      AbortOnDrop::new(tokio::spawn(async move {
-        let exit_status = child.wait().await.unwrap();
-        close_channel(client_address_, client_id_, &handle, channel_id, &exit_status).await;
-        drop(child);
-      })),
-    );
+    AbortOnDrop::new(tokio::spawn(async move {
+      let exit_status = child.wait().await.unwrap();
+      close_channel(client_address_, client_id_, &handle, channel_id, &exit_status).await;
+      drop(child);
+    }))
   }
 
   /// Execute a command in a given PTY. Upon exit, close the SSH channel.
@@ -353,7 +339,7 @@ impl ServerHandler {
     handle: russh::server::Handle,
     pty_stuff: &PtyStuff,
     command_spec: &ExecResponseAccept,
-  ) -> Result<(), <Self as russh::server::Handler>::Error> {
+  ) -> Result<AbortOnDrop, <Self as russh::server::Handler>::Error> {
     // Spawn a new process in pty
     let child = pty_process::Command::new(&command_spec.command)
           // Security critial: Use `env_clear()` so we don't inherit environment
@@ -370,6 +356,9 @@ impl ServerHandler {
           .context("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.")?;
     tracing::info!(pid = child.id(), "child spawned");
 
+    // Do this before resizing the PTY, in case the resize fails.
+    let wait_handle = self.wait_and_close_channel(channel_id, handle, child).await;
+
     // Notes:
     // 1. We already set up a task to read from the PTY and send to the SSH
     //    client in `pty_request`, so we don't need to do it here.
@@ -378,15 +367,12 @@ impl ServerHandler {
     //    is spawned on macOS. See https://github.com/doy/pty-process/issues/7#issuecomment-1826196215
     //    and https://github.com/pkgw/stund/issues/305.
     // 3. `pty_process::Size::new` flips the order of col_width and row_height!
-    if let Err(error) = pty_stuff.pty_writer.resize(pty_process::Size::new(
+    pty_stuff.pty_writer.resize(pty_process::Size::new(
       pty_stuff.requested_row_height,
       pty_stuff.requested_col_width,
-    )) {
-      tracing::error!(?error, "pty.resize failed");
-    }
+    ))?;
 
-    self.close_channel_on_child_exit(channel_id, handle, child).await;
-    Ok(())
+    Ok(wait_handle)
   }
 
   /// Execute a command without a PTY.
@@ -396,7 +382,7 @@ impl ServerHandler {
     channel_id: ChannelId,
     handle: russh::server::Handle,
     command_spec: &ExecResponseAccept,
-  ) -> Result<(), <Self as russh::server::Handler>::Error> {
+  ) -> Result<(tokio::process::ChildStdin, AbortOnDrop), <Self as russh::server::Handler>::Error> {
     let mut child = tokio::process::Command::new(&command_spec.command)
           // Security critial: Use `env_clear()` so we don't inherit environment
           // variables from the parent process.
@@ -414,10 +400,6 @@ impl ServerHandler {
           .spawn()
           .context("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.")?;
     tracing::info!(pid = child.id(), "child spawned");
-
-    // Add stdin to our stdin_writers `HashMap` so that we can write to it later in `data`
-    let stdin = child.stdin.take().context("Failed to get stdin for child process")?;
-    self.stdin_writers.lock().await.insert(channel_id, stdin);
 
     // Read bytes from the child stdout and send them to the SSH client
     let mut stdout = child.stdout.take().context("Failed to get stdout for child process")?;
@@ -446,8 +428,11 @@ impl ServerHandler {
       }
     });
 
-    self.close_channel_on_child_exit(channel_id, handle, child).await;
-    Ok(())
+    let stdin = child.stdin.take().context("Failed to get stdin for child process")?;
+    // Note: we would like to do this as early as possible in case of Err
+    // short- circuiting the function, but it consumes ownership of `child`.
+    let wait_handle = self.wait_and_close_channel(channel_id, handle, child).await;
+    Ok((stdin, wait_handle))
   }
 }
 
@@ -496,9 +481,15 @@ impl russh::server::Handler for ServerHandler {
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn channel_open_session(
     self,
-    _channel: Channel<Msg>,
+    channel: Channel<Msg>,
     session: Session,
   ) -> Result<(Self, bool, Session), Self::Error> {
+    // Note: We don't guard against clobbering an existing channel id.
+    self
+      .channels
+      .lock()
+      .await
+      .insert(channel.id(), SshenanigansChannel::Uninitialized);
     Ok((self, true, session))
   }
 
@@ -514,47 +505,59 @@ impl russh::server::Handler for ServerHandler {
     modes: &[(russh::Pty, u32)],
     session: Session,
   ) -> Result<(Self, Session), Self::Error> {
-    // TODO: We're currently ignoring the requested modes. We should probably do something with them.
+    {
+      let mut channels = self.channels.lock().await;
+      let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
+      match channel {
+        SshenanigansChannel::Uninitialized => {
+          // TODO: We're currently ignoring the requested modes. We should
+          // probably do something with them.
 
-    let pty = pty_process::Pty::new().context("Failed to create PTY")?;
-    // NOTE: we must get `pts` before `.into_split()` because it consumes the PTY.
-    let pts = pty.pts().context("Failed to get pts")?;
+          let pty = pty_process::Pty::new().context("Failed to create PTY")?;
+          // NOTE: we must get `pts` before `.into_split()` because it consumes
+          // the PTY.
+          let pts = pty.pts().context("Failed to get pts")?;
 
-    // split pty into reader + writer
-    let (mut pty_reader, pty_writer) = pty.into_split();
+          // split pty into reader + writer
+          let (mut pty_reader, pty_writer) = pty.into_split();
 
-    // Insert all the goodies into `self.ptys`. We save the requested terminal size so we can resize the PTY later in
-    // `shell_request`. Most clients seem to send a `pty_request` before a `shell_request`, and it's not clear that
-    // sending `pty_request` after `shell_request` is support by the SSH spec.
-    self.ptys.lock().await.insert(
-      channel_id,
-      PtyStuff {
-        requested_col_width: col_width as u16,
-        requested_row_height: row_height as u16,
-        pts,
-        pty_writer,
-      },
-    );
+          // Insert all the goodies into `self.channels`. We save the requested
+          // terminal size so we can resize the PTY later in `shell_request`.
+          // Most clients seem to send a `pty_request` before a `shell_request`,
+          // and it's not clear that sending `pty_request` after `shell_request`
+          // is support by the SSH spec or makes any sense.
+          *channel = SshenanigansChannel::PtyExec {
+            _child_abort_handle: None,
+            stuff: PtyStuff {
+              requested_col_width: col_width as u16,
+              requested_row_height: row_height as u16,
+              pts,
+              pty_writer,
+            },
+          };
 
-    // Read bytes from the PTY and send them to the SSH client
-    let session_handle = session.handle();
-    tokio::spawn(async move {
-      let mut buffer = vec![0; 1024];
-      while let Ok(n) = pty_reader.read(&mut buffer).await {
-        if n == 0 {
-          break;
+          // Read bytes from the PTY and send them to the SSH client
+          let session_handle = session.handle();
+          tokio::spawn(async move {
+            let mut buffer = vec![0; 1024];
+            while let Ok(n) = pty_reader.read(&mut buffer).await {
+              if n == 0 {
+                break;
+              }
+              send_data(
+                self.client_address,
+                self.client_id,
+                channel_id,
+                &session_handle,
+                &buffer[0..n],
+              )
+              .await;
+            }
+          });
         }
-        send_data(
-          self.client_address,
-          self.client_id,
-          channel_id,
-          &session_handle,
-          &buffer[0..n],
-        )
-        .await;
+        _ => bail!("expected Uninitialized channel"),
       }
-    });
-
+    }
     Ok((self, session))
   }
 
@@ -579,7 +582,7 @@ impl russh::server::Handler for ServerHandler {
   }
 
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
-  async fn shell_request(self, channel_id: ChannelId, mut session: Session) -> Result<(Self, Session), Self::Error> {
+  async fn shell_request(self, channel_id: ChannelId, session: Session) -> Result<(Self, Session), Self::Error> {
     let resp: ExecResponse = self.gatekeeper_call(RequestType::Shell {
       verified_credentials: self
         .verified_credentials
@@ -587,9 +590,31 @@ impl russh::server::Handler for ServerHandler {
         .context("shell_request called when verified_credentials is None")?,
       requested_environment_variables: self.requested_environment_variables.clone(),
     })?;
-    self
-      .gatekeeper_handle_exec_response(channel_id, &mut session, resp)
-      .await?;
+    let accept = resp.accept.context("gatekeeper denied request")?;
+
+    {
+      let mut channels = self.channels.lock().await;
+      let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
+
+      let handle = session.handle();
+      match channel {
+        SshenanigansChannel::Uninitialized => {
+          let (stdin_writer, _child_abort_handle) = self.non_pty_exec(channel_id, handle, &accept).await?;
+          *channel = SshenanigansChannel::NonPtyExec {
+            _child_abort_handle,
+            stdin_writer,
+          };
+        }
+        SshenanigansChannel::PtyExec {
+          _child_abort_handle,
+          stuff,
+        } => {
+          let handle = self.pty_exec(channel_id, handle, stuff, &accept).await?;
+          *_child_abort_handle = Some(handle);
+        }
+        _ => bail!("expected Uninitialized or PtyExec channel"),
+      }
+    }
 
     Ok((self, session))
   }
@@ -597,25 +622,36 @@ impl russh::server::Handler for ServerHandler {
   /// SSH client sends data, pipe it to the corresponding PTY or stdin
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session), level = "trace")]
   async fn data(self, channel_id: ChannelId, data: &[u8], session: Session) -> Result<(Self, Session), Self::Error> {
-    if let Some(PtyStuff { pty_writer, .. }) = self.ptys.lock().await.get_mut(&channel_id) {
-      tracing::debug!(?data, "writing to pty_writer");
-      pty_writer.write_all(data).await.context("Failed to write to PTY")?;
-    } else if let Some(stdin_writer) = self.stdin_writers.lock().await.get_mut(&channel_id) {
-      tracing::debug!(?data, "writing to stdin_writer");
-      stdin_writer.write_all(data).await.context("Failed to write to stdin")?;
-    } else {
-      tracing::warn!("could not find outlet for data, skipping write");
+    tracing::trace!(data_utf8 = ?String::from_utf8_lossy(data));
+    {
+      let mut channels = self.channels.lock().await;
+      let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
+      match channel {
+        SshenanigansChannel::PtyExec {
+          stuff: PtyStuff { ref mut pty_writer, .. },
+          ..
+        } => {
+          tracing::trace!(?data, "writing to pty_writer");
+          pty_writer.write_all(data).await.context("Failed to write to PTY")?;
+        }
+        SshenanigansChannel::NonPtyExec {
+          ref mut stdin_writer, ..
+        } => {
+          tracing::trace!(?data, "writing to stdin_writer");
+          stdin_writer.write_all(data).await.context("Failed to write to stdin")?;
+        }
+        _ => bail!("expected PtyExec or NonPtyExec channel"),
+      }
     }
-
     Ok((self, session))
   }
 
-  #[tracing::instrument(parent = &self.tracing_span, skip(self, session, command))]
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, command, session))]
   async fn exec_request(
     self,
     channel_id: ChannelId,
     command: &[u8],
-    mut session: Session,
+    session: Session,
   ) -> Result<(Self, Session), Self::Error> {
     let command_string = String::from_utf8(command.to_vec())?;
     tracing::info!(?command_string);
@@ -628,10 +664,31 @@ impl russh::server::Handler for ServerHandler {
       requested_environment_variables: self.requested_environment_variables.clone(),
       command: command_string,
     })?;
-    self
-      .gatekeeper_handle_exec_response(channel_id, &mut session, resp)
-      .await?;
+    let accept = resp.accept.context("gatekeeper denied request")?;
 
+    {
+      let mut channels = self.channels.lock().await;
+      let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
+
+      let handle = session.handle();
+      match channel {
+        SshenanigansChannel::Uninitialized => {
+          let (stdin_writer, _child_abort_handle) = self.non_pty_exec(channel_id, handle, &accept).await?;
+          *channel = SshenanigansChannel::NonPtyExec {
+            _child_abort_handle,
+            stdin_writer,
+          };
+        }
+        SshenanigansChannel::PtyExec {
+          _child_abort_handle,
+          stuff,
+        } => {
+          let handle = self.pty_exec(channel_id, handle, stuff, &accept).await?;
+          *_child_abort_handle = Some(handle);
+        }
+        _ => bail!("expected Uninitialized or PtyExec channel"),
+      }
+    }
     Ok((self, session))
   }
 
@@ -646,29 +703,31 @@ impl russh::server::Handler for ServerHandler {
     _pix_height: u32,
     session: Session,
   ) -> Result<(Self, Session), Self::Error> {
-    if let Some(PtyStuff { pty_writer, .. }) = self.ptys.lock().await.get_mut(&channel_id) {
-      if let Err(error) = pty_writer.resize(pty_process::Size::new(row_height as u16, col_width as u16)) {
-        tracing::error!(?error, "pty.resize failed");
+    {
+      let mut channels = self.channels.lock().await;
+      let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
+      match channel {
+        SshenanigansChannel::PtyExec {
+          stuff: PtyStuff { ref mut pty_writer, .. },
+          ..
+        } => {
+          pty_writer.resize(pty_process::Size::new(row_height as u16, col_width as u16))?;
+        }
+        _ => bail!("expected PtyExec channel"),
       }
-    } else {
-      tracing::warn!("ptys doesn't contain channel_id, skipping pty resize");
     }
-
     Ok((self, session))
   }
 
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn channel_close(self, channel_id: ChannelId, session: Session) -> Result<(Self, Session), Self::Error> {
-    // Removing from `self.child_abort_handles` and dropping results in the
-    // corresponding child process being killed. This is important since we
-    // don't want to leak processes. Child processes will be killed since
-    // child_abort_handles contains `AbortOnDrop`s which contain
-    // `tokio::task::AbortHandle`s for tokio tasks that own
+    // Removing from `self.channdels` and dropping results in the corresponding
+    // child process being killed. Besides avoiding a memory leak, this is
+    // important since we don't want to leak processes. Child processes will be
+    // killed since their associated channel struct will contain `AbortOnDrop`s
+    // which contain `tokio::task::AbortHandle`s for tokio tasks that own
     // `tokio::process::Child`s that have `kill_on_drop(true)` set.
-    drop(self.child_abort_handles.lock().await.remove(&channel_id));
-    drop(self.ptys.lock().await.remove(&channel_id));
-    drop(self.stdin_writers.lock().await.remove(&channel_id));
-
+    drop(self.channels.lock().await.remove(&channel_id));
     Ok((self, session))
   }
 }
