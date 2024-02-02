@@ -51,7 +51,15 @@ struct PtyStuff {
 
 /// A type representing the state of a channel. `ServerHandler` is a state
 /// machine that transitions between these states as the SSH client sends
-/// requests.
+/// requests. Most of the action is in `SshenanigansChannelType`.
+struct SshenanigansChannel {
+  /// Environment variables requested by the client via `env_request`.
+  requested_environment_variables: HashMap<String, String>,
+
+  state: SshenanigansChannelState,
+}
+
+/// The state of a channel.
 ///
 /// For each channel, a handle that when dropped will abort a tokio task
 /// owning the corresponding child process for that channel. This is necessary
@@ -69,7 +77,7 @@ struct PtyStuff {
 ///
 /// Note that we can't actually own the `Child` in these since `child.wait()`,
 /// takes ownership.
-enum SshenanigansChannel {
+enum SshenanigansChannelState {
   /// Every channel starts out life as an `Uninitialized` channel in
   /// `channel_open_session`.
   Uninitialized,
@@ -105,9 +113,6 @@ struct ServerHandler {
   /// authentication.
   verified_credentials: Option<Credentials>,
 
-  /// Environment variables requested by the client via `env_request`.
-  requested_environment_variables: HashMap<String, String>,
-
   channels: Arc<Mutex<HashMap<ChannelId, SshenanigansChannel>>>,
 }
 
@@ -134,7 +139,6 @@ impl russh::server::Server for Server {
       client_id,
       client_address,
       verified_credentials: None,
-      requested_environment_variables: HashMap::new(),
       channels: Arc::new(Mutex::new(HashMap::new())),
     }
   }
@@ -485,11 +489,13 @@ impl russh::server::Handler for ServerHandler {
     session: Session,
   ) -> Result<(Self, bool, Session), Self::Error> {
     // Note: We don't guard against clobbering an existing channel id.
-    self
-      .channels
-      .lock()
-      .await
-      .insert(channel.id(), SshenanigansChannel::Uninitialized);
+    self.channels.lock().await.insert(
+      channel.id(),
+      SshenanigansChannel {
+        requested_environment_variables: HashMap::new(),
+        state: SshenanigansChannelState::Uninitialized,
+      },
+    );
     Ok((self, true, session))
   }
 
@@ -508,8 +514,8 @@ impl russh::server::Handler for ServerHandler {
     {
       let mut channels = self.channels.lock().await;
       let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
-      match channel {
-        SshenanigansChannel::Uninitialized => {
+      match channel.state {
+        SshenanigansChannelState::Uninitialized => {
           // TODO: We're currently ignoring the requested modes. We should
           // probably do something with them.
 
@@ -526,7 +532,7 @@ impl russh::server::Handler for ServerHandler {
           // Most clients seem to send a `pty_request` before a `shell_request`,
           // and it's not clear that sending `pty_request` after `shell_request`
           // is support by the SSH spec or makes any sense.
-          *channel = SshenanigansChannel::PtyExec {
+          channel.state = SshenanigansChannelState::PtyExec {
             _child_abort_handle: None,
             stuff: PtyStuff {
               requested_col_width: col_width as u16,
@@ -564,52 +570,50 @@ impl russh::server::Handler for ServerHandler {
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn env_request(
     self,
-    _channel: ChannelId,
+    channel_id: ChannelId,
     variable_name: &str,
     variable_value: &str,
     session: Session,
   ) -> Result<(Self, Session), Self::Error> {
-    let mut env = self.requested_environment_variables;
-    env.insert(variable_name.to_owned(), variable_value.to_owned());
-
-    Ok((
-      Self {
-        requested_environment_variables: env,
-        ..self
-      },
-      session,
-    ))
+    {
+      let mut channels = self.channels.lock().await;
+      let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
+      channel
+        .requested_environment_variables
+        .insert(variable_name.to_owned(), variable_value.to_owned());
+    }
+    Ok((self, session))
   }
 
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn shell_request(self, channel_id: ChannelId, session: Session) -> Result<(Self, Session), Self::Error> {
-    let resp: ExecResponse = self.gatekeeper_call(RequestType::Shell {
-      verified_credentials: self
-        .verified_credentials
-        .clone()
-        .context("shell_request called when verified_credentials is None")?,
-      requested_environment_variables: self.requested_environment_variables.clone(),
-    })?;
-    let accept = resp.accept.context("gatekeeper denied request")?;
-
     {
       let mut channels = self.channels.lock().await;
       let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
 
+      let resp: ExecResponse = self.gatekeeper_call(RequestType::Shell {
+        verified_credentials: self
+          .verified_credentials
+          .clone()
+          .context("shell_request called when verified_credentials is None")?,
+        requested_environment_variables: channel.requested_environment_variables.clone(),
+      })?;
+      let accept = resp.accept.context("gatekeeper denied request")?;
+
       let handle = session.handle();
-      match channel {
-        SshenanigansChannel::Uninitialized => {
+      match &mut channel.state {
+        SshenanigansChannelState::Uninitialized => {
           let (stdin_writer, _child_abort_handle) = self.non_pty_exec(channel_id, handle, &accept).await?;
-          *channel = SshenanigansChannel::NonPtyExec {
+          channel.state = SshenanigansChannelState::NonPtyExec {
             _child_abort_handle,
             stdin_writer,
           };
         }
-        SshenanigansChannel::PtyExec {
-          _child_abort_handle,
+        SshenanigansChannelState::PtyExec {
+          ref mut _child_abort_handle,
           stuff,
         } => {
-          let handle = self.pty_exec(channel_id, handle, stuff, &accept).await?;
+          let handle = self.pty_exec(channel_id, handle, &stuff, &accept).await?;
           *_child_abort_handle = Some(handle);
         }
         _ => bail!("expected Uninitialized or PtyExec channel"),
@@ -626,15 +630,15 @@ impl russh::server::Handler for ServerHandler {
     {
       let mut channels = self.channels.lock().await;
       let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
-      match channel {
-        SshenanigansChannel::PtyExec {
+      match channel.state {
+        SshenanigansChannelState::PtyExec {
           stuff: PtyStuff { ref mut pty_writer, .. },
           ..
         } => {
           tracing::trace!(?data, "writing to pty_writer");
           pty_writer.write_all(data).await.context("Failed to write to PTY")?;
         }
-        SshenanigansChannel::NonPtyExec {
+        SshenanigansChannelState::NonPtyExec {
           ref mut stdin_writer, ..
         } => {
           tracing::trace!(?data, "writing to stdin_writer");
@@ -656,34 +660,34 @@ impl russh::server::Handler for ServerHandler {
     let command_string = String::from_utf8(command.to_vec())?;
     tracing::info!(?command_string);
 
-    let resp: ExecResponse = self.gatekeeper_call(RequestType::Exec {
-      verified_credentials: self
-        .verified_credentials
-        .clone()
-        .context("exec_request called when verified_credentials is None")?,
-      requested_environment_variables: self.requested_environment_variables.clone(),
-      command: command_string,
-    })?;
-    let accept = resp.accept.context("gatekeeper denied request")?;
-
     {
       let mut channels = self.channels.lock().await;
       let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
 
+      let resp: ExecResponse = self.gatekeeper_call(RequestType::Exec {
+        verified_credentials: self
+          .verified_credentials
+          .clone()
+          .context("exec_request called when verified_credentials is None")?,
+        requested_environment_variables: channel.requested_environment_variables.clone(),
+        command: command_string,
+      })?;
+      let accept = resp.accept.context("gatekeeper denied request")?;
+
       let handle = session.handle();
-      match channel {
-        SshenanigansChannel::Uninitialized => {
+      match &mut channel.state {
+        SshenanigansChannelState::Uninitialized => {
           let (stdin_writer, _child_abort_handle) = self.non_pty_exec(channel_id, handle, &accept).await?;
-          *channel = SshenanigansChannel::NonPtyExec {
+          channel.state = SshenanigansChannelState::NonPtyExec {
             _child_abort_handle,
             stdin_writer,
           };
         }
-        SshenanigansChannel::PtyExec {
-          _child_abort_handle,
+        SshenanigansChannelState::PtyExec {
+          ref mut _child_abort_handle,
           stuff,
         } => {
-          let handle = self.pty_exec(channel_id, handle, stuff, &accept).await?;
+          let handle = self.pty_exec(channel_id, handle, &stuff, &accept).await?;
           *_child_abort_handle = Some(handle);
         }
         _ => bail!("expected Uninitialized or PtyExec channel"),
@@ -706,8 +710,8 @@ impl russh::server::Handler for ServerHandler {
     {
       let mut channels = self.channels.lock().await;
       let channel = channels.get_mut(&channel_id).context("channel_id not found")?;
-      match channel {
-        SshenanigansChannel::PtyExec {
+      match channel.state {
+        SshenanigansChannelState::PtyExec {
           stuff: PtyStuff { ref mut pty_writer, .. },
           ..
         } => {
