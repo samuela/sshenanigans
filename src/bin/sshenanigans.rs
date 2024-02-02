@@ -588,11 +588,12 @@ impl russh::server::Handler for ServerHandler {
     {
       let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
 
+      let verified_credentials = self
+        .verified_credentials
+        .clone()
+        .context("expected verified_credentials")?;
       let resp: ExecResponse = self.gatekeeper_call(RequestType::Shell {
-        verified_credentials: self
-          .verified_credentials
-          .clone()
-          .context("shell_request called when verified_credentials is None")?,
+        verified_credentials,
         requested_environment_variables: channel.requested_environment_variables.clone(),
       })?;
       let accept = resp.accept.context("gatekeeper denied request")?;
@@ -659,11 +660,12 @@ impl russh::server::Handler for ServerHandler {
     {
       let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
 
+      let verified_credentials = self
+        .verified_credentials
+        .clone()
+        .context("expected verified_credentials")?;
       let resp: ExecResponse = self.gatekeeper_call(RequestType::Exec {
-        verified_credentials: self
-          .verified_credentials
-          .clone()
-          .context("exec_request called when verified_credentials is None")?,
+        verified_credentials,
         requested_environment_variables: channel.requested_environment_variables.clone(),
         command: command_string,
       })?;
