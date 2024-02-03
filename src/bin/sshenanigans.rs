@@ -344,110 +344,129 @@ impl ServerHandler {
     }))
   }
 
-  /// Execute a command in a given PTY. Upon exit, close the SSH channel.
-  // `command_spec` tends to be quite verbose and can possibly contain secrets,
-  // so we don't log it.
-  #[tracing::instrument(level = "debug", skip(self, handle, pty_stuff, command_spec))]
-  async fn pty_exec(
+  /// Check gatekeeper, then run a `shell_request` or `exec_request` command
+  #[tracing::instrument(level = "debug", skip(self, handle, mk_request_type))]
+  async fn maybe_run_user_command_on_channel(
     &self,
     channel_id: ChannelId,
     handle: russh::server::Handle,
-    pty_stuff: &PtyStuff,
-    command_spec: &ExecResponseAccept,
-  ) -> Result<AbortOnDrop, <Self as russh::server::Handler>::Error> {
-    // Spawn a new process in pty
-    let child = pty_process::Command::new(&command_spec.command)
-          // Security critial: Use `env_clear()` so we don't inherit environment
-          // variables from the parent process.
-          .env_clear()
-          // kill_on_drop(true) is essential to prevent leaking processes.
-          .kill_on_drop(true)
-          .envs(&command_spec.environment_variables)
-          .args(&command_spec.arguments)
-          .current_dir(&command_spec.working_directory)
-          .uid(command_spec.uid)
-          .gid(command_spec.gid)
-          .spawn(&pty_stuff.pts)
-          .context("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.")?;
-    tracing::info!(pid = child.id(), "child spawned");
-
-    // Do this before resizing the PTY, in case the resize fails.
-    let wait_handle = self.wait_and_close_channel(channel_id, handle, child).await;
-
-    // Notes:
-    // 1. We already set up a task to read from the PTY and send to the SSH
-    //    client in `pty_request`, so we don't need to do it here.
-    // 2. We must resize the PTY according to the requested size. We don't do
-    //    this at PTY creation time since we can't resize until after the child
-    //    is spawned on macOS. See https://github.com/doy/pty-process/issues/7#issuecomment-1826196215
-    //    and https://github.com/pkgw/stund/issues/305.
-    // 3. `pty_process::Size::new` flips the order of col_width and row_height!
-    pty_stuff.pty_writer.resize(pty_process::Size::new(
-      pty_stuff.requested_row_height,
-      pty_stuff.requested_col_width,
+    mk_request_type: impl FnOnce(Credentials, HashMap<String, String>) -> RequestType,
+  ) -> Result<(), <Self as russh::server::Handler>::Error> {
+    let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
+    let verified_credentials = self
+      .verified_credentials
+      .clone()
+      .context("expected verified_credentials")?;
+    let resp: ExecResponse = self.gatekeeper_call(mk_request_type(
+      verified_credentials,
+      channel.requested_environment_variables.clone(),
     ))?;
+    let accept = resp.accept.context("gatekeeper denied request")?;
 
-    Ok(wait_handle)
-  }
+    match &mut channel.state {
+      SshenanigansChannelState::Uninitialized => {
+        let mut child = tokio::process::Command::new(&accept.command)
+              // Security critial: Use `env_clear()` so we don't inherit
+              // environment variables from the parent process.
+              .env_clear()
+              // kill_on_drop(true) is essential to prevent leaking processes.
+              .kill_on_drop(true)
+              .envs(&accept.environment_variables)
+              .args(&accept.arguments)
+              .current_dir(&accept.working_directory)
+              .uid(accept.uid)
+              .gid(accept.gid)
+              .stdin(std::process::Stdio::piped())
+              .stdout(std::process::Stdio::piped())
+              .stderr(std::process::Stdio::piped())
+              .spawn()
+              .context("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.")?;
+        tracing::info!(pid = child.id(), "child spawned");
 
-  /// Execute a command without a PTY.
-  #[tracing::instrument(level = "debug", skip(self, handle, command_spec))]
-  async fn non_pty_exec(
-    &self,
-    channel_id: ChannelId,
-    handle: russh::server::Handle,
-    command_spec: &ExecResponseAccept,
-  ) -> Result<(tokio::process::ChildStdin, AbortOnDrop), <Self as russh::server::Handler>::Error> {
-    let mut child = tokio::process::Command::new(&command_spec.command)
-          // Security critial: Use `env_clear()` so we don't inherit environment
-          // variables from the parent process.
-          .env_clear()
-          // kill_on_drop(true) is essential to prevent leaking processes.
-          .kill_on_drop(true)
-          .envs(&command_spec.environment_variables)
-          .args(&command_spec.arguments)
-          .current_dir(&command_spec.working_directory)
-          .uid(command_spec.uid)
-          .gid(command_spec.gid)
-          .stdin(std::process::Stdio::piped())
-          .stdout(std::process::Stdio::piped())
-          .stderr(std::process::Stdio::piped())
-          .spawn()
-          .context("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.")?;
-    tracing::info!(pid = child.id(), "child spawned");
+        // Read bytes from the child stdout and send them to the SSH client
+        let mut stdout = child.stdout.take().context("Failed to get stdout for child process")?;
+        let handle_ = handle.clone();
+        let client_address_ = self.client_address;
+        let client_id_ = self.client_id;
+        tokio::spawn(async move {
+          let mut buffer = vec![0; 1024];
+          while let Ok(n) = stdout.read(&mut buffer).await {
+            if n == 0 {
+              break;
+            }
+            send_data(client_address_, client_id_, channel_id, &handle_, &buffer[0..n]).await;
+          }
+        });
+        // Now, same for stderr...
+        let mut stderr = child.stderr.take().context("Failed to get stderr for child process")?;
+        let handle_ = handle.clone();
+        tokio::spawn(async move {
+          let mut buffer = vec![0; 1024];
+          while let Ok(n) = stderr.read(&mut buffer).await {
+            if n == 0 {
+              break;
+            }
+            send_data(client_address_, client_id_, channel_id, &handle_, &buffer[0..n]).await;
+          }
+        });
 
-    // Read bytes from the child stdout and send them to the SSH client
-    let mut stdout = child.stdout.take().context("Failed to get stdout for child process")?;
-    let handle_ = handle.clone();
-    let client_address_ = self.client_address;
-    let client_id_ = self.client_id;
-    tokio::spawn(async move {
-      let mut buffer = vec![0; 1024];
-      while let Ok(n) = stdout.read(&mut buffer).await {
-        if n == 0 {
-          break;
-        }
-        send_data(client_address_, client_id_, channel_id, &handle_, &buffer[0..n]).await;
+        let stdin_writer = child.stdin.take().context("Failed to get stdin for child process")?;
+        // Note: we would like to `wait_and_close_channel` as early as possible
+        // in case of Err short-circuiting the function, but it consumes
+        // ownership of `child`.
+        let _child_abort_handle = self.wait_and_close_channel(channel_id, handle, child).await;
+
+        channel.state = SshenanigansChannelState::NonPtyExec {
+          _child_abort_handle,
+          stdin_writer,
+        };
       }
-    });
-    // Now, same for stderr...
-    let mut stderr = child.stderr.take().context("Failed to get stderr for child process")?;
-    let handle_ = handle.clone();
-    tokio::spawn(async move {
-      let mut buffer = vec![0; 1024];
-      while let Ok(n) = stderr.read(&mut buffer).await {
-        if n == 0 {
-          break;
-        }
-        send_data(client_address_, client_id_, channel_id, &handle_, &buffer[0..n]).await;
-      }
-    });
+      SshenanigansChannelState::PtyExec {
+        ref mut _child_abort_handle,
+        stuff:
+          PtyStuff {
+            requested_col_width,
+            requested_row_height,
+            pts,
+            pty_writer,
+          },
+      } => {
+        // Spawn a new process in pty
+        let child = pty_process::Command::new(&accept.command)
+              // Security critial: Use `env_clear()` so we don't inherit
+              // environment variables from the parent process.
+              .env_clear()
+              // kill_on_drop(true) is essential to prevent leaking processes.
+              .kill_on_drop(true)
+              .envs(&accept.environment_variables)
+              .args(&accept.arguments)
+              .current_dir(&accept.working_directory)
+              .uid(accept.uid)
+              .gid(accept.gid)
+              .spawn(pts)
+              .context("Failed to spawn child process. This can happen due to working_directory not existing, or insufficient permissions to set uid/gid.")?;
+        tracing::info!(pid = child.id(), "child spawned");
 
-    let stdin = child.stdin.take().context("Failed to get stdin for child process")?;
-    // Note: we would like to do this as early as possible in case of Err
-    // short- circuiting the function, but it consumes ownership of `child`.
-    let wait_handle = self.wait_and_close_channel(channel_id, handle, child).await;
-    Ok((stdin, wait_handle))
+        // Do this before resizing the PTY, in case the resize fails.
+        let wait_handle = self.wait_and_close_channel(channel_id, handle, child).await;
+
+        // Notes:
+        // 1. We already set up a task to read from the PTY and send to the SSH
+        //    client in `pty_request`, so we don't need to do it here.
+        // 2. We must resize the PTY according to the requested size. We don't
+        //    do this at PTY creation time since we can't resize until after the
+        //    child is spawned on macOS. See https://github.com/doy/pty-process/issues/7#issuecomment-1826196215
+        //    and https://github.com/pkgw/stund/issues/305.
+        // 3. `pty_process::Size::new` flips the order of `col_width` and
+        //    `row_height`!
+        pty_writer.resize(pty_process::Size::new(*requested_row_height, *requested_col_width))?;
+
+        *_child_abort_handle = Some(wait_handle);
+      }
+      _ => bail!("expected Uninitialized or PtyExec channel"),
+    };
+
+    Ok(())
   }
 }
 
@@ -596,39 +615,17 @@ impl russh::server::Handler for ServerHandler {
 
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn shell_request(self, channel_id: ChannelId, session: Session) -> Result<(Self, Session), Self::Error> {
-    {
-      let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
-
-      let verified_credentials = self
-        .verified_credentials
-        .clone()
-        .context("expected verified_credentials")?;
-      let resp: ExecResponse = self.gatekeeper_call(RequestType::Shell {
-        verified_credentials,
-        requested_environment_variables: channel.requested_environment_variables.clone(),
-      })?;
-      let accept = resp.accept.context("gatekeeper denied request")?;
-
-      let handle = session.handle();
-      match &mut channel.state {
-        SshenanigansChannelState::Uninitialized => {
-          let (stdin_writer, _child_abort_handle) = self.non_pty_exec(channel_id, handle, &accept).await?;
-          channel.state = SshenanigansChannelState::NonPtyExec {
-            _child_abort_handle,
-            stdin_writer,
-          };
-        }
-        SshenanigansChannelState::PtyExec {
-          ref mut _child_abort_handle,
-          stuff,
-        } => {
-          let handle = self.pty_exec(channel_id, handle, stuff, &accept).await?;
-          *_child_abort_handle = Some(handle);
-        }
-        _ => bail!("expected Uninitialized or PtyExec channel"),
-      }
-    }
-
+    let handle = session.handle();
+    self
+      .maybe_run_user_command_on_channel(
+        channel_id,
+        handle,
+        |verified_credentials, requested_environment_variables| RequestType::Shell {
+          verified_credentials,
+          requested_environment_variables,
+        },
+      )
+      .await?;
     Ok((self, session))
   }
 
@@ -674,39 +671,18 @@ impl russh::server::Handler for ServerHandler {
     let command_string = String::from_utf8(command.to_vec())?;
     tracing::info!(?command_string);
 
-    {
-      let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
-
-      let verified_credentials = self
-        .verified_credentials
-        .clone()
-        .context("expected verified_credentials")?;
-      let resp: ExecResponse = self.gatekeeper_call(RequestType::Exec {
-        verified_credentials,
-        requested_environment_variables: channel.requested_environment_variables.clone(),
-        command: command_string,
-      })?;
-      let accept = resp.accept.context("gatekeeper denied request")?;
-
-      let handle = session.handle();
-      match &mut channel.state {
-        SshenanigansChannelState::Uninitialized => {
-          let (stdin_writer, _child_abort_handle) = self.non_pty_exec(channel_id, handle, &accept).await?;
-          channel.state = SshenanigansChannelState::NonPtyExec {
-            _child_abort_handle,
-            stdin_writer,
-          };
-        }
-        SshenanigansChannelState::PtyExec {
-          ref mut _child_abort_handle,
-          stuff,
-        } => {
-          let handle = self.pty_exec(channel_id, handle, stuff, &accept).await?;
-          *_child_abort_handle = Some(handle);
-        }
-        _ => bail!("expected Uninitialized or PtyExec channel"),
-      }
-    }
+    let handle = session.handle();
+    self
+      .maybe_run_user_command_on_channel(
+        channel_id,
+        handle,
+        move |verified_credentials, requested_environment_variables| RequestType::Exec {
+          verified_credentials,
+          requested_environment_variables,
+          command: command_string,
+        },
+      )
+      .await?;
     Ok((self, session))
   }
 
