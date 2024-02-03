@@ -1261,8 +1261,8 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.41.0-beta.2"
-source = "git+https://github.com/samuela/russh.git?rev=ea64035c504984f99d18b49d935dc97d5ecdb396#ea64035c504984f99d18b49d935dc97d5ecdb396"
+version = "0.41.0-beta.4"
+source = "git+https://github.com/warp-tech/russh.git?rev=44a2392bd0bc170f6f829cddbefa89a93392851d#44a2392bd0bc170f6f829cddbefa89a93392851d"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1296,7 +1296,7 @@ dependencies = [
 [[package]]
 name = "russh-cryptovec"
 version = "0.7.2"
-source = "git+https://github.com/samuela/russh.git?rev=ea64035c504984f99d18b49d935dc97d5ecdb396#ea64035c504984f99d18b49d935dc97d5ecdb396"
+source = "git+https://github.com/warp-tech/russh.git?rev=44a2392bd0bc170f6f829cddbefa89a93392851d#44a2392bd0bc170f6f829cddbefa89a93392851d"
 dependencies = [
  "libc",
  "winapi",
@@ -1304,8 +1304,8 @@ dependencies = [
 
 [[package]]
 name = "russh-keys"
-version = "0.41.0-beta.1"
-source = "git+https://github.com/samuela/russh.git?rev=ea64035c504984f99d18b49d935dc97d5ecdb396#ea64035c504984f99d18b49d935dc97d5ecdb396"
+version = "0.41.0-beta.3"
+source = "git+https://github.com/warp-tech/russh.git?rev=44a2392bd0bc170f6f829cddbefa89a93392851d#44a2392bd0bc170f6f829cddbefa89a93392851d"
 dependencies = [
  "aes",
  "async-trait",
