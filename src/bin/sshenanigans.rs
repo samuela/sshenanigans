@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use uuid::Uuid;
@@ -187,21 +187,30 @@ async fn close_channel(
   }
 }
 
-#[tracing::instrument(level = "trace", skip(handle))]
-async fn send_data(
-  client_address: Option<SocketAddr>,
-  client_id: Uuid,
+async fn pipe_to_channel<R>(
   channel_id: ChannelId,
-  handle: &russh::server::Handle,
-  data: &[u8],
-) {
-  // Note: this can sometimes result in an Err. Possibly due to the SSH client
-  // closing the channel before we can finish writing to it?
-  //
-  // TODO: debug and come up with a better solution
-  if let Err(error) = handle.data(channel_id, CryptoVec::from_slice(data)).await {
-    tracing::error!(?error, "sending data failed");
-  }
+  handle: russh::server::Handle,
+  mut reader: R,
+) -> tokio::task::JoinHandle<()>
+where
+  R: tokio::io::AsyncReadExt + std::marker::Unpin + Send + 'static,
+{
+  tokio::spawn(async move {
+    let mut buffer = vec![0; 1024];
+    while let Ok(n) = reader.read(&mut buffer).await {
+      if n == 0 {
+        break;
+      }
+
+      // Note: this can sometimes result in an Err. Possibly due to the SSH client
+      // closing the channel before we can finish writing to it?
+      //
+      // TODO: debug and come up with a better solution
+      if let Err(error) = handle.data(channel_id, CryptoVec::from_slice(&buffer[0..n])).await {
+        tracing::error!(?error, "sending data failed");
+      }
+    }
+  })
 }
 
 /// SSH server flow for shell with PTY (eg `ssh foo@bar`):
@@ -384,31 +393,12 @@ impl ServerHandler {
         tracing::info!(pid = child.id(), "child spawned");
 
         // Read bytes from the child stdout and send them to the SSH client
-        let mut stdout = child.stdout.take().context("Failed to get stdout for child process")?;
-        let handle_ = handle.clone();
-        let client_address_ = self.client_address;
-        let client_id_ = self.client_id;
-        tokio::spawn(async move {
-          let mut buffer = vec![0; 1024];
-          while let Ok(n) = stdout.read(&mut buffer).await {
-            if n == 0 {
-              break;
-            }
-            send_data(client_address_, client_id_, channel_id, &handle_, &buffer[0..n]).await;
-          }
-        });
+        let stdout = child.stdout.take().context("Failed to get stdout for child process")?;
+        pipe_to_channel(channel_id, handle.clone(), stdout).await;
+
         // Now, same for stderr...
-        let mut stderr = child.stderr.take().context("Failed to get stderr for child process")?;
-        let handle_ = handle.clone();
-        tokio::spawn(async move {
-          let mut buffer = vec![0; 1024];
-          while let Ok(n) = stderr.read(&mut buffer).await {
-            if n == 0 {
-              break;
-            }
-            send_data(client_address_, client_id_, channel_id, &handle_, &buffer[0..n]).await;
-          }
-        });
+        let stderr = child.stderr.take().context("Failed to get stderr for child process")?;
+        pipe_to_channel(channel_id, handle.clone(), stderr).await;
 
         let stdin_writer = child.stdin.take().context("Failed to get stdin for child process")?;
         // Note: we would like to `wait_and_close_channel` as early as possible
@@ -554,7 +544,11 @@ impl russh::server::Handler for ServerHandler {
           let pts = pty.pts().context("Failed to get pts")?;
 
           // split pty into reader + writer
-          let (mut pty_reader, pty_writer) = pty.into_split();
+          let (pty_reader, pty_writer) = pty.into_split();
+
+          // Read bytes from the PTY and send them to the SSH client
+          let handle = session.handle();
+          pipe_to_channel(channel_id, handle, pty_reader).await;
 
           // Insert all the goodies into `self.channels`. We save the requested
           // terminal size so we can resize the PTY later in `shell_request`.
@@ -570,25 +564,6 @@ impl russh::server::Handler for ServerHandler {
               pty_writer,
             },
           };
-
-          // Read bytes from the PTY and send them to the SSH client
-          let session_handle = session.handle();
-          tokio::spawn(async move {
-            let mut buffer = vec![0; 1024];
-            while let Ok(n) = pty_reader.read(&mut buffer).await {
-              if n == 0 {
-                break;
-              }
-              send_data(
-                self.client_address,
-                self.client_id,
-                channel_id,
-                &session_handle,
-                &buffer[0..n],
-              )
-              .await;
-            }
-          });
         }
         _ => bail!("expected Uninitialized channel"),
       }
@@ -791,19 +766,9 @@ impl russh::server::Handler for ServerHandler {
       tracing::info!(pid = child.id(), "child spawned");
 
       // Read bytes from the child stdout and send them to the SSH client
-      let mut stdout = child.stdout.take().context("Failed to get stdout for child process")?;
+      let stdout = child.stdout.take().context("Failed to get stdout for child process")?;
       let handle_ = session.handle().clone();
-      let client_address_ = self.client_address;
-      let client_id_ = self.client_id;
-      tokio::spawn(async move {
-        let mut buffer = vec![0; 1024];
-        while let Ok(n) = stdout.read(&mut buffer).await {
-          if n == 0 {
-            break;
-          }
-          send_data(client_address_, client_id_, channel_id, &handle_, &buffer[0..n]).await;
-        }
-      });
+      pipe_to_channel(channel_id, handle_, stdout).await;
 
       let stdin = child.stdin.take().context("Failed to get stdin for child process")?;
       // Note: we would like to `wait_and_close_channel` as early as possible in
