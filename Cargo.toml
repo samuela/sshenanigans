@@ -17,6 +17,7 @@ anyhow = "*"
 async-trait = "*"
 clap = { version = "*", features = ["derive"] }
 dashmap = "*"
+futures = "*"
 nix = { version = "*", features = ["user"] }
 
 # See https://github.com/doy/pty-process/pull/8#issuecomment-1829236622.

@@ -2,6 +2,7 @@ use anyhow::{bail, Context};
 use async_trait::async_trait;
 use clap::Parser;
 use dashmap::DashMap;
+use futures::future::join_all;
 use pty_process::OwnedWritePty;
 use russh::server::{Auth, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec, MethodSet};
@@ -12,11 +13,12 @@ use sshenanigans::{
 };
 use std::collections::HashMap;
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use uuid::Uuid;
@@ -801,10 +803,11 @@ struct Args {
   #[arg(long, required = true)]
   host_key_path: Vec<PathBuf>,
 
-  /// Address to listen on.
-  // Supporting multiple addresses is blocked on https://github.com/warp-tech/russh/issues/223.
-  #[arg(long, default_value = "0.0.0.0:22")]
-  listen: SocketAddr,
+  /// Addresses to listen on. [default: [::]:22, 0.0.0.0:22]
+  // Default value logic is handled in `main` since it can't be done with
+  // multiple values in `Args`.
+  #[arg(long)]
+  listen: Vec<SocketAddr>,
 
   /// The Gatekeeper command. Note that relative paths must start with ./ or similar.
   #[arg(long)]
@@ -862,10 +865,20 @@ async fn main() -> anyhow::Result<()> {
     ..Default::default()
   };
 
-  let socket = tokio::net::TcpListener::bind(&args.listen).await.context(format!(
-    "Failed to bind to socket {}. Are you sure you have permissions to bind to the given socket address?",
+  let addresses = if args.listen.is_empty() {
+    vec![
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 22),
+      SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), 22),
+    ]
+  } else {
     args.listen
-  ))?;
+  };
+  tracing::debug!(?addresses, "binding to sockets");
+  let sockets: Vec<TcpListener> = join_all(addresses.iter().map(TcpListener::bind))
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .context("failed to bind sockets")?;
 
   // setgid before setuid, since generally speaking we won't have permission to
   // setgid after setuid.
@@ -878,18 +891,24 @@ async fn main() -> anyhow::Result<()> {
     nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)).context("failed to drop privileges with setuid")?;
   }
 
-  tracing::info!(listening_on = args.listen.to_string(), "listening on socket");
-  russh::server::run_on_socket(
-    Arc::new(config),
-    &socket,
-    Server {
-      // This indexing is safe since we assert that `gatekeeper_split` is not empty above.
-      gatekeeper_command: gatekeeper_split[0].into(),
-      gatekeeper_args: gatekeeper_split[1..].iter().map(|s| s.to_string()).collect(),
-    },
-  )
+  tracing::info!(?addresses, "listening on sockets");
+  // We join a task per address to work around https://github.com/warp-tech/russh/issues/223.
+  let config_ = Arc::new(config);
+  join_all(sockets.iter().map(|socket| {
+    russh::server::run_on_socket(
+      config_.clone(),
+      socket,
+      Server {
+        // This indexing is safe since we assert that `gatekeeper_split` is not empty above.
+        gatekeeper_command: gatekeeper_split[0].into(),
+        gatekeeper_args: gatekeeper_split[1..].iter().map(|s| s.to_string()).collect(),
+      },
+    )
+  }))
   .await
-  .context("Failed to run SSH server main loop")?;
+  .into_iter()
+  .collect::<Result<Vec<_>, _>>()
+  .context("failed to start ssh server tasks")?;
 
   Ok(())
 }
