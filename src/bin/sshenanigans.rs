@@ -798,7 +798,7 @@ impl russh::server::Handler for ServerHandler {
 #[command(author, version, about, long_about = None)]
 struct Args {
   /// Path to private key files for the host. Can be specified multiple times, and at least one is required.
-  #[arg(long)]
+  #[arg(long, required = true)]
   host_key_path: Vec<PathBuf>,
 
   /// Address to listen on.
@@ -827,24 +827,6 @@ struct Args {
   keepalive_max_unanswered: usize,
 }
 
-fn load_host_keys(host_key_paths: Vec<PathBuf>) -> Vec<russh_keys::key::KeyPair> {
-  if host_key_paths.is_empty() {
-    tracing::error!("At least one --host-key-path is required");
-    std::process::exit(1);
-  }
-
-  host_key_paths
-    .iter()
-    .map(|path| {
-      // NOTE: we don't support encrypted keys or "~/foo" paths yet.
-      russh_keys::load_secret_key(path, None).unwrap_or_else(|error| {
-        tracing::error!(?path, ?error, "Failed to load host key");
-        std::process::exit(1);
-      })
-    })
-    .collect()
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
   tracing_subscriber::registry()
@@ -864,7 +846,17 @@ async fn main() -> anyhow::Result<()> {
 
   let config = russh::server::Config {
     auth_rejection_time: std::time::Duration::from_secs(1),
-    keys: load_host_keys(args.host_key_path),
+    keys: args
+      .host_key_path
+      .iter()
+      .map(|path| {
+        // NOTE: we don't support encrypted keys or "~/foo" paths yet.
+        russh_keys::load_secret_key(path, None).unwrap_or_else(|error| {
+          tracing::error!(?path, ?error, "Failed to load host key");
+          std::process::exit(1);
+        })
+      })
+      .collect(),
     keepalive_interval: args.keepalive_interval_seconds.map(std::time::Duration::from_secs),
     keepalive_max: args.keepalive_max_unanswered,
     ..Default::default()
