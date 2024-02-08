@@ -27,8 +27,9 @@ pty-process = { git = "https://github.com/samuela/pty-process.git", rev = "968c2
 # We need
 #  * https://github.com/warp-tech/russh/pull/231 [merged, not yet released]
 #  * https://github.com/warp-tech/russh/pull/241 [merged, not yet released]
-russh = { git = "https://github.com/warp-tech/russh.git", rev = "44a2392bd0bc170f6f829cddbefa89a93392851d" }
-russh-keys = { git = "https://github.com/warp-tech/russh.git", rev = "44a2392bd0bc170f6f829cddbefa89a93392851d" }
+#  * https://github.com/warp-tech/russh/pull/243 [merged, not yet released]
+russh = { git = "https://github.com/warp-tech/russh.git", rev = "1541fe581fe677199723da22891f7019fc54dce8" }
+russh-keys = { git = "https://github.com/warp-tech/russh.git", rev = "1541fe581fe677199723da22891f7019fc54dce8" }
 
 serde = "*"
 serde_json = "*"

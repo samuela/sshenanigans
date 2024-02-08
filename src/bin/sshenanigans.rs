@@ -817,6 +817,14 @@ struct Args {
   /// Optionally drop privileges to this group after binding to the socket.
   #[arg(long)]
   setgid: Option<u32>,
+
+  /// Optionally send keepalive messages at this interval.
+  #[arg(long)]
+  keepalive_interval_seconds: Option<u64>,
+
+  /// Close connections after this many unanswered keepalive messages.
+  #[arg(long, default_value_t = 3)]
+  keepalive_max_unanswered: usize,
 }
 
 fn load_host_keys(host_key_paths: Vec<PathBuf>) -> Vec<russh_keys::key::KeyPair> {
@@ -855,9 +863,10 @@ async fn main() -> anyhow::Result<()> {
   assert!(!gatekeeper_split.is_empty(), "gatekeeper command must not be empty");
 
   let config = russh::server::Config {
-    inactivity_timeout: Some(std::time::Duration::from_secs(30 * 60)),
     auth_rejection_time: std::time::Duration::from_secs(1),
     keys: load_host_keys(args.host_key_path),
+    keepalive_interval: args.keepalive_interval_seconds.map(std::time::Duration::from_secs),
+    keepalive_max: args.keepalive_max_unanswered,
     ..Default::default()
   };
 
