@@ -40,6 +40,11 @@ pub enum RequestType {
     originator_address: String,
     originator_port: u32,
   },
+  Subsystem {
+    verified_credentials: Credentials,
+    requested_environment_variables: HashMap<String, String>,
+    subsystem: String,
+  },
 }
 
 #[derive(Serialize)]

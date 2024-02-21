@@ -12,7 +12,7 @@ Features:
 
 ## Gatekeeper API
 
-There are four types of requests sent to The Gatekeeper: `Auth`, `Shell`, `Exec`, and `LocalPortForward`. The Gatekeeper will receive one request per invocation. The Gatekeeper should exit with status zero in nominal operation, even when rejecting requests. Exiting in a non-zero status code will cause sshenanigans to produce an error and reject the request.
+There are five types of requests sent to The Gatekeeper: `Auth`, `Shell`, `Exec`, `LocalPortForward`, and `Subsystem`. The Gatekeeper will receive one request per invocation. The Gatekeeper should exit with status zero in nominal operation, even when rejecting requests. Exiting in a non-zero status code will cause sshenanigans to produce an error and reject the request.
 
 The Gatekeeper may implement handling for any subset of the request types, but should always terminate. A malformed or missing response will be interpreted as a rejection of the request by sshenanigans.
 
@@ -152,7 +152,27 @@ This request is commonly triggered by invoking SSH with a local port forward, eg
 }
 ```
 
-And responses follow the same structure as for `Shell` and `Exec` requests. If sshenanigans receives an approval response, it will spawn a process as specified by the response. sshenanigans will send TCP bytes received from the client to the process's stdin, and will send TCP bytes received from the process's stdout to the client.
+And responses follow the same structure as for `Shell` requests. If sshenanigans receives an approval response, it will spawn a process as specified by the response. sshenanigans will send TCP bytes received from the client to the process's stdin, and will send TCP bytes received from the process's stdout to the client.
+
+### `Subsystem` requests
+
+This request is commonly triggered by invoking `scp` which relies on the SFTP subsystem, eg. `scp file.txt user@host:~`. In this case, the request will take the form
+
+```json
+{
+  "client_address": "174.168.101.116:60531",
+  "client_id": "bf001b29-29e1-4754-be0c-37810b6fc703",
+  "request": {
+    "Subsystem": {
+      "verified_credentials": { "username": "sam", "method": "None" },
+      "requested_environment_variables": { "LC_TERMINAL": "xterm-256color" },
+      "subsystem": "sftp"
+    }
+  }
+}
+```
+
+And responses follow the same structure as for `Shell` requests. If sshenanigans receives an approval response, it will spawn a process as specified by the response. sshenanigans will send TCP bytes received from the client to the process's stdin, and will send TCP bytes received from the process's stdout to the client.
 
 ## Getting started
 

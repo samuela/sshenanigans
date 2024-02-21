@@ -701,6 +701,26 @@ impl russh::server::Handler for ServerHandler {
     Ok((self, session))
   }
 
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
+  async fn channel_eof(self, channel_id: ChannelId, session: Session) -> Result<(Self, Session), Self::Error> {
+    // This will be called instead of `channel_close` by eg sftp subsystem
+    // channels.
+
+    let handle = session.handle();
+    close_channel(
+      self.client_address,
+      self.client_id,
+      &handle,
+      channel_id,
+      // We just assume a 0 exit code here to appease the scp gods. If we don't
+      // send an exit status the scp client will exit with status 1.
+      &std::process::ExitStatus::from_raw(0),
+    )
+    .await;
+    drop(self.channels.remove(&channel_id));
+    Ok((self, session))
+  }
+
   /// Arguments are such that on the client this looks like:
   ///
   ///   ssh -L 8080:<host_to_connect>:<port_to_connect> bitbop.io
@@ -792,6 +812,32 @@ impl russh::server::Handler for ServerHandler {
     }
 
     Ok((self, true, session))
+  }
+
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
+  async fn subsystem_request(
+    self,
+    channel_id: ChannelId,
+    subsystem: &str,
+    session: Session,
+  ) -> Result<(Self, Session), Self::Error> {
+    // Test this with eg `scp something.txt bitbop.io:~` or
+    // `ssh -s bitbop.io sftp`.
+
+    let handle = session.handle();
+    self
+      .maybe_run_user_command_on_channel(
+        channel_id,
+        handle,
+        move |verified_credentials, requested_environment_variables| RequestType::Subsystem {
+          verified_credentials,
+          requested_environment_variables,
+          subsystem: subsystem.to_owned(),
+        },
+      )
+      .await?;
+
+    Ok((self, session))
   }
 }
 
