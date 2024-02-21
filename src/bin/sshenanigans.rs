@@ -691,7 +691,7 @@ impl russh::server::Handler for ServerHandler {
 
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn channel_close(self, channel_id: ChannelId, session: Session) -> Result<(Self, Session), Self::Error> {
-    // Removing from `self.channdels` and dropping results in the corresponding
+    // Removing from `self.channels` and dropping results in the corresponding
     // child process being killed. Besides avoiding a memory leak, this is
     // important since we don't want to leak processes. Child processes will be
     // killed since their associated channel struct will contain `AbortOnDrop`s
