@@ -91,7 +91,8 @@ This request is associated with the standard invocation of `ssh user@host`. Requ
   "client_id": "62783347-a23f-42d6-b05b-0c107384f583",
   "request": {
     "Shell": {
-      "verified_credentials": { "username": "sam", "method": "None" }
+      "verified_credentials": { "username": "sam", "method": "None" },
+      "requested_environment_variables": { "LC_TERMINAL": "xterm-256color" }
     }
   }
 }
@@ -124,6 +125,7 @@ This request is commonly triggered by invoking SSH with a command, eg. `ssh user
   "request": {
     "Exec": {
       "verified_credentials": { "username": "sam", "method": "None" },
+      "requested_environment_variables": { "LC_TERMINAL": "xterm-256color" },
       "command": "ls -al"
     }
   }
