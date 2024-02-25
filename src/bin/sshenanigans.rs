@@ -750,6 +750,13 @@ impl russh::server::Handler for ServerHandler {
     originator_port: u32,
     session: Session,
   ) -> Result<(Self, bool, Session), Self::Error> {
+    // TODO: explore unifying this with `maybe_run_user_command_on_channel`.
+    // Differences include:
+    //  * stderr is inherited here
+    //  * we are expected to return Ok((_, false, _)) when rejecting the request
+    //  * we would like to update `channel.state` to be `LocalPortForward`
+    //  * this can be called before `channel_open_session` and therefore we
+    //    won't have an entry in `self.channels` yet.
     let channel_id = channel.id();
     {
       let verified_credentials = self
@@ -776,6 +783,7 @@ impl russh::server::Handler for ServerHandler {
           .env_clear()
           // kill_on_drop(true) is essential to prevent leaking processes.
           .kill_on_drop(true)
+          .envs(&accept.environment_variables)
           .args(&accept.arguments)
           .current_dir(&accept.working_directory)
           .uid(accept.uid)
@@ -802,7 +810,11 @@ impl russh::server::Handler for ServerHandler {
       self.channels.insert(
         channel_id,
         SshenanigansChannel {
-          requested_environment_variables: HashMap::new(),
+          requested_environment_variables: self
+            .channels
+            .get(&channel_id)
+            .map(|c| c.requested_environment_variables.to_owned())
+            .unwrap_or_else(HashMap::new),
           state: SshenanigansChannelState::LocalPortForward {
             _child_abort_handle: wait_handle,
             stdin_writer: stdin,
