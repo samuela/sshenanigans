@@ -202,3 +202,13 @@ sshenanigans is in active development. Please report any issues you find! A few 
 4. sshenanigans is not intended to replace OpenSSH. If OpenSSH suits your needs, use it for its stability and battle-hardened security.
 
 If you are curious about sshenanigans's security, you are encouraged to check out the source. The implementation is <750 lines of Rust code.
+
+# Licensing
+
+sshenanigans is licensed under the [AGPLv3 license](https://www.gnu.org/licenses/agpl-3.0.en.html). In short, if you use sshenanigans to provide a service over a network, you must make the source code of the complete product available to the users of that service, regardless of whether you modify sshenanigans. That being said, sshenanigans is also available under an MIT license in the following contexts:
+
+1. You are using sshenanigans for personal, non-commercial use.
+2. You are using sshenanigans in a not-for-profit organization and for non-commercial use, eg. academia.
+3. You are using sshenanigans in a commercial context and the total number of users, internal and external, of sshenanigans-based services/products is less than 100. In this context, a "user" is defined as any account, human or computer, that can authenticate to sshenanigans, or any account that can (transitively) access a service provided by sshenanigans.
+
+Please [reach out](mailto:skainsworth+sshenanigans@gmail.com) to discuss licensing options if you are interested in using sshenanigans under an MIT license in any other context. A portion of all proceeds go to axial spondyloarthritis (aka ankylosing spondylitis) research.
