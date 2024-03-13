@@ -10,11 +10,16 @@
         pkgs = nixpkgs.legacyPackages."${system}";
         naersk-lib = naersk.lib."${system}";
       in
+      with pkgs;
       rec {
         # `nix build`
         packages.default = naersk-lib.buildPackage {
           pname = "sshenanigans";
           root = ./.;
+
+          # See https://github.com/nix-community/naersk?tab=readme-ov-file#using-openssl.
+          nativeBuildInputs = [ pkg-config ];
+          buildInputs = [ openssl.dev ];
         };
 
         # `nix run`
@@ -23,8 +28,17 @@
         };
 
         # `nix develop`
-        devShell = pkgs.mkShell {
-          nativeBuildInputs = with pkgs; ([ rustc cargo rustfmt ] ++ lib.optionals stdenv.isDarwin [ libiconv ]);
+        devShell = mkShell {
+          nativeBuildInputs = ([
+            rustc
+            cargo
+            rustfmt
+
+            # See https://nixos.wiki/wiki/Rust#Building_Rust_crates_that_require_external_system_libraries.
+            # sshenanigans uses russh with the "openssl" feature, which requires this.
+            openssl.dev
+            pkg-config
+          ] ++ lib.optionals stdenv.isDarwin [ libiconv ]);
         };
       });
 }
