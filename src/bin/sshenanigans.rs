@@ -801,7 +801,7 @@ impl russh::server::Handler for ServerHandler {
             .channels
             .get(&channel_id)
             .map(|c| c.requested_environment_variables.to_owned())
-            .unwrap_or_else(HashMap::new),
+            .unwrap_or_default(),
           state: SshenanigansChannelState::LocalPortForward {
             _child_abort_handle: wait_handle,
             stdin_writer: stdin,
