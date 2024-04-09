@@ -25,12 +25,9 @@ nix = { version = "*", features = ["user"] }
 # See https://github.com/doy/pty-process/issues/10.
 pty-process = { git = "https://github.com/samuela/pty-process.git", rev = "968c2dc6af18addce179e9396f50bac6c1ee0cca", features = ["async"] }
 
-# We need
-#  * https://github.com/warp-tech/russh/pull/231 [merged, not yet released]
-#  * https://github.com/warp-tech/russh/pull/241 [merged, not yet released]
-#  * https://github.com/warp-tech/russh/pull/243 [merged, not yet released]
-russh = { git = "https://github.com/warp-tech/russh.git", rev = "1541fe581fe677199723da22891f7019fc54dce8", features = ["openssl"] }
-russh-keys = { git = "https://github.com/warp-tech/russh.git", rev = "1541fe581fe677199723da22891f7019fc54dce8", features = ["openssl"] }
+# See https://github.com/warp-tech/russh/issues/261 as to why the openssl feature is needed.
+russh = { version = "0.43.0", features = ["openssl"] }
+russh-keys = { version = "0.43.0", features = ["openssl"] }
 
 serde = "*"
 serde_json = "*"

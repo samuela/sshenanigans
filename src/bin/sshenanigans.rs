@@ -4,6 +4,7 @@ use clap::Parser;
 use dashmap::DashMap;
 use futures::future::join_all;
 use pty_process::OwnedWritePty;
+use russh::server::Server as _;
 use russh::server::{Auth, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec, MethodSet};
 use russh_keys::PublicKeyBase64;
@@ -291,9 +292,9 @@ impl ServerHandler {
   // NOTE: we don't log `unverified_credentials` since it can contain passwords.
   #[tracing::instrument(level = "debug", skip(self, unverified_credentials))]
   fn gatekeeper_make_auth_request(
-    self,
+    &mut self,
     unverified_credentials: &Credentials,
-  ) -> Result<(ServerHandler, Auth), <Self as russh::server::Handler>::Error> {
+  ) -> Result<Auth, <Self as russh::server::Handler>::Error> {
     let response: AuthResponse = self
       .gatekeeper_call(RequestType::Auth {
         unverified_credentials: unverified_credentials.clone(),
@@ -303,13 +304,8 @@ impl ServerHandler {
     Ok(match response {
       AuthResponse { accept: true, .. } => {
         tracing::info!("gatekeeper accepted auth request");
-        (
-          Self {
-            verified_credentials: Some(unverified_credentials.clone()),
-            ..self
-          },
-          russh::server::Auth::Accept,
-        )
+        self.verified_credentials = Some(unverified_credentials.clone());
+        russh::server::Auth::Accept
       }
       AuthResponse {
         accept: false,
@@ -317,21 +313,16 @@ impl ServerHandler {
         ..
       } => {
         tracing::info!(?proceed_with_methods, "gatekeeper rejected auth request");
-        (
-          Self {
-            verified_credentials: None,
-            ..self
-          },
-          russh::server::Auth::Reject {
-            proceed_with_methods: proceed_with_methods.map(|methods| {
-              MethodSet::from_iter(
-                methods
-                  .iter()
-                  .map(|method| MethodSet::from_name(method).expect("Bad method name in `proceed_with_methods`. Allowed values are 'NONE', 'PASSWORD', 'PUBLICKEY', 'HOSTBASED', 'KEYBOARD_INTERACTIVE' (case sensitive).")),
-              )
-            }),
-          },
-        )
+        self.verified_credentials = None;
+        russh::server::Auth::Reject {
+          proceed_with_methods: proceed_with_methods.map(|methods| {
+            MethodSet::from_iter(
+              methods
+                .iter()
+                .map(|method| MethodSet::from_name(method).expect("Bad method name in `proceed_with_methods`. Allowed values are 'NONE', 'PASSWORD', 'PUBLICKEY', 'HOSTBASED', 'KEYBOARD_INTERACTIVE' (case sensitive).")),
+            )
+          }),
+        }
       }
     })
   }
@@ -467,7 +458,7 @@ impl russh::server::Handler for ServerHandler {
   type Error = anyhow::Error;
 
   #[tracing::instrument(parent = &self.tracing_span, skip(self))]
-  async fn auth_none(self, username: &str) -> Result<(Self, Auth), Self::Error> {
+  async fn auth_none(&mut self, username: &str) -> Result<Auth, Self::Error> {
     self.gatekeeper_make_auth_request(&Credentials {
       username: username.to_owned(),
       method: CredentialsType::None,
@@ -475,7 +466,7 @@ impl russh::server::Handler for ServerHandler {
   }
 
   #[tracing::instrument(parent = &self.tracing_span, skip(self, password))]
-  async fn auth_password(self, username: &str, password: &str) -> Result<(Self, Auth), Self::Error> {
+  async fn auth_password(&mut self, username: &str, password: &str) -> Result<Auth, Self::Error> {
     self.gatekeeper_make_auth_request(&Credentials {
       username: username.to_owned(),
       method: CredentialsType::Password {
@@ -487,10 +478,10 @@ impl russh::server::Handler for ServerHandler {
   // `public_key` Debug prints in a format that is basically worthless.
   #[tracing::instrument(parent = &self.tracing_span, skip(self, public_key))]
   async fn auth_publickey(
-    self,
+    &mut self,
     username: &str,
     public_key: &russh_keys::key::PublicKey,
-  ) -> Result<(Self, Auth), Self::Error> {
+  ) -> Result<Auth, Self::Error> {
     let public_key_algorithm = public_key.name().to_owned();
     let public_key_base64 = public_key.public_key_base64();
     tracing::info!(public_key_algorithm, public_key_base64);
@@ -504,12 +495,8 @@ impl russh::server::Handler for ServerHandler {
   }
 
   // Not a lot of logic here, but russh requires this handler.
-  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
-  async fn channel_open_session(
-    self,
-    channel: Channel<Msg>,
-    session: Session,
-  ) -> Result<(Self, bool, Session), Self::Error> {
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, _session))]
+  async fn channel_open_session(&mut self, channel: Channel<Msg>, _session: &mut Session) -> Result<bool, Self::Error> {
     // Note: We don't guard against clobbering an existing channel id.
     self.channels.insert(
       channel.id(),
@@ -518,12 +505,12 @@ impl russh::server::Handler for ServerHandler {
         state: SshenanigansChannelState::Uninitialized,
       },
     );
-    Ok((self, true, session))
+    Ok(true)
   }
 
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn pty_request(
-    self,
+    &mut self,
     channel_id: ChannelId,
     term: &str,
     col_width: u32,
@@ -531,8 +518,8 @@ impl russh::server::Handler for ServerHandler {
     _pix_width: u32,
     _pix_height: u32,
     modes: &[(russh::Pty, u32)],
-    session: Session,
-  ) -> Result<(Self, Session), Self::Error> {
+    session: &mut Session,
+  ) -> Result<(), Self::Error> {
     {
       let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
       match channel.state {
@@ -570,28 +557,28 @@ impl russh::server::Handler for ServerHandler {
         _ => bail!("expected Uninitialized channel"),
       }
     }
-    Ok((self, session))
+    Ok(())
   }
 
-  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, _session))]
   async fn env_request(
-    self,
+    &mut self,
     channel_id: ChannelId,
     variable_name: &str,
     variable_value: &str,
-    session: Session,
-  ) -> Result<(Self, Session), Self::Error> {
+    _session: &mut Session,
+  ) -> Result<(), Self::Error> {
     {
       let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
       channel
         .requested_environment_variables
         .insert(variable_name.to_owned(), variable_value.to_owned());
     }
-    Ok((self, session))
+    Ok(())
   }
 
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
-  async fn shell_request(self, channel_id: ChannelId, session: Session) -> Result<(Self, Session), Self::Error> {
+  async fn shell_request(&mut self, channel_id: ChannelId, session: &mut Session) -> Result<(), Self::Error> {
     let handle = session.handle();
     self
       .maybe_run_user_command_on_channel(
@@ -603,12 +590,12 @@ impl russh::server::Handler for ServerHandler {
         },
       )
       .await?;
-    Ok((self, session))
+    Ok(())
   }
 
   /// SSH client sends data, pipe it to the corresponding PTY or stdin
-  #[tracing::instrument(parent = &self.tracing_span, skip(self, session), level = "trace")]
-  async fn data(self, channel_id: ChannelId, data: &[u8], session: Session) -> Result<(Self, Session), Self::Error> {
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, _session), level = "trace")]
+  async fn data(&mut self, channel_id: ChannelId, data: &[u8], _session: &mut Session) -> Result<(), Self::Error> {
     tracing::trace!(data_utf8 = ?String::from_utf8_lossy(data));
     {
       let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
@@ -635,16 +622,16 @@ impl russh::server::Handler for ServerHandler {
         _ => bail!("expected PtyExec, NonPtyExec, or LocalPortForward channel"),
       }
     }
-    Ok((self, session))
+    Ok(())
   }
 
   #[tracing::instrument(parent = &self.tracing_span, skip(self, command, session))]
   async fn exec_request(
-    self,
+    &mut self,
     channel_id: ChannelId,
     command: &[u8],
-    session: Session,
-  ) -> Result<(Self, Session), Self::Error> {
+    session: &mut Session,
+  ) -> Result<(), Self::Error> {
     let command_string = String::from_utf8(command.to_vec())?;
     tracing::info!(?command_string);
 
@@ -660,20 +647,20 @@ impl russh::server::Handler for ServerHandler {
         },
       )
       .await?;
-    Ok((self, session))
+    Ok(())
   }
 
   /// The client's pseudo-terminal window size has changed.
-  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, _session))]
   async fn window_change_request(
-    self,
+    &mut self,
     channel_id: ChannelId,
     col_width: u32,
     row_height: u32,
     _pix_width: u32,
     _pix_height: u32,
-    session: Session,
-  ) -> Result<(Self, Session), Self::Error> {
+    _session: &mut Session,
+  ) -> Result<(), Self::Error> {
     {
       let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
       match channel.state {
@@ -686,11 +673,11 @@ impl russh::server::Handler for ServerHandler {
         _ => bail!("expected PtyExec channel"),
       }
     }
-    Ok((self, session))
+    Ok(())
   }
 
-  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
-  async fn channel_close(self, channel_id: ChannelId, session: Session) -> Result<(Self, Session), Self::Error> {
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, _session))]
+  async fn channel_close(&mut self, channel_id: ChannelId, _session: &mut Session) -> Result<(), Self::Error> {
     // Removing from `self.channels` and dropping results in the corresponding
     // child process being killed. Besides avoiding a memory leak, this is
     // important since we don't want to leak processes. Child processes will be
@@ -698,11 +685,11 @@ impl russh::server::Handler for ServerHandler {
     // which contain `tokio::task::AbortHandle`s for tokio tasks that own
     // `tokio::process::Child`s that have `kill_on_drop(true)` set.
     drop(self.channels.remove(&channel_id));
-    Ok((self, session))
+    Ok(())
   }
 
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
-  async fn channel_eof(self, channel_id: ChannelId, session: Session) -> Result<(Self, Session), Self::Error> {
+  async fn channel_eof(&mut self, channel_id: ChannelId, session: &mut Session) -> Result<(), Self::Error> {
     // This will be called instead of `channel_close` by eg sftp subsystem
     // channels.
 
@@ -718,7 +705,7 @@ impl russh::server::Handler for ServerHandler {
     )
     .await;
     drop(self.channels.remove(&channel_id));
-    Ok((self, session))
+    Ok(())
   }
 
   /// Arguments are such that on the client this looks like:
@@ -742,14 +729,14 @@ impl russh::server::Handler for ServerHandler {
   /// connection is made to their local socket.
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn channel_open_direct_tcpip(
-    self,
+    &mut self,
     channel: Channel<Msg>,
     host_to_connect: &str,
     port_to_connect: u32,
     originator_address: &str,
     originator_port: u32,
-    session: Session,
-  ) -> Result<(Self, bool, Session), Self::Error> {
+    session: &mut Session,
+  ) -> Result<bool, Self::Error> {
     // TODO: explore unifying this with `maybe_run_user_command_on_channel`.
     // Differences include:
     //  * stderr is inherited here
@@ -774,7 +761,7 @@ impl russh::server::Handler for ServerHandler {
       // in contrast to most of the other handlers.
       let accept: ExecResponseAccept = match resp.accept {
         Some(x) => x,
-        None => return Ok((self, false, session)),
+        None => return Ok(false),
       };
 
       let mut child = tokio::process::Command::new(&accept.command)
@@ -823,16 +810,16 @@ impl russh::server::Handler for ServerHandler {
       );
     }
 
-    Ok((self, true, session))
+    Ok(true)
   }
 
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
   async fn subsystem_request(
-    self,
+    &mut self,
     channel_id: ChannelId,
     subsystem: &str,
-    session: Session,
-  ) -> Result<(Self, Session), Self::Error> {
+    session: &mut Session,
+  ) -> Result<(), Self::Error> {
     // Test this with eg `scp something.txt bitbop.io:~` or
     // `ssh -s bitbop.io sftp`.
 
@@ -849,7 +836,7 @@ impl russh::server::Handler for ServerHandler {
       )
       .await?;
 
-    Ok((self, session))
+    Ok(())
   }
 }
 
@@ -953,15 +940,14 @@ async fn main() -> anyhow::Result<()> {
   // We join a task per address to work around https://github.com/warp-tech/russh/issues/223.
   let config_ = Arc::new(config);
   join_all(sockets.iter().map(|socket| {
-    russh::server::run_on_socket(
-      config_.clone(),
-      socket,
-      Server {
+    async {
+      let mut server = Server {
         // This indexing is safe since we assert that `gatekeeper_split` is not empty above.
         gatekeeper_command: gatekeeper_split[0].into(),
         gatekeeper_args: gatekeeper_split[1..].iter().map(|s| s.to_string()).collect(),
-      },
-    )
+      };
+      server.run_on_socket(config_.clone(), socket).await
+    }
   }))
   .await
   .into_iter()
