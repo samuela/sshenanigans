@@ -211,6 +211,7 @@ where
       // TODO: debug and come up with a better solution
       if let Err(error) = handle.data(channel_id, CryptoVec::from_slice(&buffer[0..n])).await {
         tracing::error!(?error, "sending data failed");
+        break;
       }
     }
   })
