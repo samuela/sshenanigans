@@ -26,7 +26,7 @@ nix = { version = "*", features = ["user"] }
 pty-process = { git = "https://github.com/samuela/pty-process.git", rev = "968c2dc6af18addce179e9396f50bac6c1ee0cca", features = ["async"] }
 
 # See https://github.com/warp-tech/russh/issues/261 as to why the openssl feature is needed.
-russh = { version = "0.43.0", features = ["openssl"] }
+russh = { version = "0.44.1", features = ["openssl"] }
 russh-keys = { version = "0.43.0", features = ["openssl"] }
 
 serde = "*"
