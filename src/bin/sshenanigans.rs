@@ -1,13 +1,12 @@
 use anyhow::{bail, Context};
-use async_trait::async_trait;
 use clap::Parser;
 use dashmap::DashMap;
 use futures::future::join_all;
 use pty_process::OwnedWritePty;
+use russh::keys::PublicKeyBase64;
 use russh::server::Server as _;
 use russh::server::{Auth, Msg, Session};
-use russh::{Channel, ChannelId, CryptoVec, MethodSet};
-use russh_keys::PublicKeyBase64;
+use russh::{Channel, ChannelId, CryptoVec, MethodKind, MethodSet};
 use serde::de::DeserializeOwned;
 use sshenanigans::{
   AuthResponse, Credentials, CredentialsType, ExecResponse, ExecResponseAccept, Request, RequestType,
@@ -15,8 +14,10 @@ use sshenanigans::{
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::Deref;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -319,10 +320,10 @@ impl ServerHandler {
         self.verified_credentials = None;
         russh::server::Auth::Reject {
           proceed_with_methods: proceed_with_methods.map(|methods| {
-            MethodSet::from_iter(
+            MethodSet::from(
               methods
                 .iter()
-                .map(|method| MethodSet::from_name(method).expect("Bad method name in `proceed_with_methods`. Allowed values are 'NONE', 'PASSWORD', 'PUBLICKEY', 'HOSTBASED', 'KEYBOARD_INTERACTIVE' (case sensitive).")),
+                .map(|method| MethodKind::from_str(method).expect("Bad method name in `proceed_with_methods`. Allowed values are 'NONE', 'PASSWORD', 'PUBLICKEY', 'HOSTBASED', 'KEYBOARD_INTERACTIVE' (case sensitive).")).collect::<Vec<MethodKind>>().deref(),
             )
           }),
         }
@@ -459,7 +460,6 @@ impl ServerHandler {
   }
 }
 
-#[async_trait]
 impl russh::server::Handler for ServerHandler {
   type Error = anyhow::Error;
 
@@ -483,12 +483,8 @@ impl russh::server::Handler for ServerHandler {
 
   // `public_key` Debug prints in a format that is basically worthless.
   #[tracing::instrument(parent = &self.tracing_span, skip(self, public_key))]
-  async fn auth_publickey(
-    &mut self,
-    username: &str,
-    public_key: &russh_keys::key::PublicKey,
-  ) -> Result<Auth, Self::Error> {
-    let public_key_algorithm = public_key.name().to_owned();
+  async fn auth_publickey(&mut self, username: &str, public_key: &russh::keys::PublicKey) -> Result<Auth, Self::Error> {
+    let public_key_algorithm = public_key.algorithm().as_str().to_owned();
     let public_key_base64 = public_key.public_key_base64();
     tracing::info!(public_key_algorithm, public_key_base64);
     self.gatekeeper_make_auth_request(&Credentials {
@@ -893,7 +889,7 @@ async fn main() -> anyhow::Result<()> {
       .iter()
       .map(|path| {
         // NOTE: we don't support encrypted keys or "~/foo" paths yet.
-        russh_keys::load_secret_key(path, None).unwrap_or_else(|error| {
+        russh::keys::load_secret_key(path, None).unwrap_or_else(|error| {
           tracing::error!(?path, ?error, "Failed to load host key");
           std::process::exit(1);
         })

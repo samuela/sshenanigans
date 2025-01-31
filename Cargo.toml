@@ -14,15 +14,13 @@ categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow = "*"
-async-trait = "*"
 clap = { version = "*", features = ["derive"] }
 dashmap = "*"
 futures = "*"
 nix = { version = "*", features = ["user"] }
 pty-process = { version = "*", features = ["async"] }
 russh = "*"
-russh-keys = "*"
-serde = "*"
+serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 tokio = { version = "*" }
 tracing = "*"
