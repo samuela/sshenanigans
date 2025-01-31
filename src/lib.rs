@@ -93,7 +93,7 @@ pub struct ExecResponseAccept {
 pub struct AuthResponse {
   /// Whether to accept the authentication request.
   pub accept: bool,
-  /// Allowed values are specified in https://docs.rs/russh/latest/russh/struct.MethodSet.html.
+  /// Allowed values are specified in <https://docs.rs/russh/latest/russh/struct.MethodSet.html>.
   /// Currently they are "NONE", "PASSWORD", "PUBLICKEY", "HOSTBASED",
   /// "KEYBOARD_INTERACTIVE" (case sensitive). A value is recommended when
   /// accept is false.
