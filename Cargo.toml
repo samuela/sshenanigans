@@ -19,12 +19,7 @@ clap = { version = "*", features = ["derive"] }
 dashmap = "*"
 futures = "*"
 nix = { version = "*", features = ["user"] }
-
-# See https://github.com/doy/pty-process/pull/8#issuecomment-1829236622.
-# pty-process = { git = "https://github.com/mobusoperandi/pty-process.git", rev = "78896303a47c370e6cd5527267d8db696ffc62f1", features = ["async"] }
-# See https://github.com/doy/pty-process/issues/10.
-pty-process = { git = "https://github.com/samuela/pty-process.git", rev = "968c2dc6af18addce179e9396f50bac6c1ee0cca", features = ["async"] }
-
+pty-process = { version = "*", features = ["async"] }
 russh = "*"
 russh-keys = "*"
 serde = "*"

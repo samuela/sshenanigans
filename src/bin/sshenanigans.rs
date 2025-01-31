@@ -45,13 +45,6 @@ struct Server {
   gatekeeper_args: Vec<String>,
 }
 
-struct PtyStuff {
-  requested_col_width: u16,
-  requested_row_height: u16,
-  pts: pty_process::Pts,
-  pty_writer: OwnedWritePty,
-}
-
 /// A type representing the state of a channel. `ServerHandler` is a state
 /// machine that transitions between these states as the SSH client sends
 /// requests. Most of the action is in `SshenanigansChannelType`.
@@ -86,11 +79,20 @@ enum SshenanigansChannelState {
   /// eg `LocalPortForward`.
   Uninitialized,
 
-  /// An `Uninitialized` channel is converted into `PtyExec` channel in
+  /// An `Uninitialized` channel is converted into `PtyRequested` channel in
   /// `pty_request`.
+  PtyRequested {
+    requested_col_width: u16,
+    requested_row_height: u16,
+    pts: pty_process::Pts,
+    pty_writer: OwnedWritePty,
+  },
+
+  /// A `PtyRequested` channel is converted into `PtyExec` channel via a
+  /// `shell_request` or `exec_request`.
   PtyExec {
-    _child_abort_handle: Option<AbortOnDrop>,
-    stuff: PtyStuff,
+    _child_abort_handle: AbortOnDrop,
+    pty_writer: OwnedWritePty,
   },
 
   /// An `Uninitialized` channel is converted into a `NonPtyExec` channel by
@@ -355,7 +357,9 @@ impl ServerHandler {
     handle: russh::server::Handle,
     mk_request_type: impl FnOnce(Credentials, HashMap<String, String>) -> RequestType,
   ) -> Result<(), <Self as russh::server::Handler>::Error> {
-    let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
+    // Take the channel out of the map so that we can take ownership of the
+    // value.
+    let (_, mut channel) = self.channels.remove(&channel_id).context("channel_id not found")?;
     let verified_credentials = self
       .verified_credentials
       .clone()
@@ -366,7 +370,7 @@ impl ServerHandler {
     ))?;
     let accept = resp.accept.context("gatekeeper denied request")?;
 
-    match &mut channel.state {
+    channel.state = match channel.state {
       SshenanigansChannelState::Uninitialized => {
         let mut child = tokio::process::Command::new(&accept.command)
               // Security critial: Use `env_clear()` so we don't inherit
@@ -400,20 +404,16 @@ impl ServerHandler {
         // ownership of `child`.
         let _child_abort_handle = self.wait_and_close_channel(channel_id, handle, child).await;
 
-        channel.state = SshenanigansChannelState::NonPtyExec {
+        SshenanigansChannelState::NonPtyExec {
           _child_abort_handle,
           stdin_writer,
-        };
+        }
       }
-      SshenanigansChannelState::PtyExec {
-        ref mut _child_abort_handle,
-        stuff:
-          PtyStuff {
-            requested_col_width,
-            requested_row_height,
-            pts,
-            pty_writer,
-          },
+      SshenanigansChannelState::PtyRequested {
+        requested_col_width,
+        requested_row_height,
+        pts,
+        pty_writer,
       } => {
         // Spawn a new process in pty
         let child = pty_process::Command::new(&accept.command)
@@ -432,7 +432,7 @@ impl ServerHandler {
         tracing::info!(pid = child.id(), "child spawned");
 
         // Do this before resizing the PTY, in case the resize fails.
-        let wait_handle = self.wait_and_close_channel(channel_id, handle, child).await;
+        let _child_abort_handle = self.wait_and_close_channel(channel_id, handle, child).await;
 
         // Notes:
         // 1. We already set up a task to read from the PTY and send to the SSH
@@ -443,13 +443,18 @@ impl ServerHandler {
         //    and https://github.com/pkgw/stund/issues/305.
         // 3. `pty_process::Size::new` flips the order of `col_width` and
         //    `row_height`!
-        pty_writer.resize(pty_process::Size::new(*requested_row_height, *requested_col_width))?;
+        pty_writer.resize(pty_process::Size::new(requested_row_height, requested_col_width))?;
 
-        *_child_abort_handle = Some(wait_handle);
+        SshenanigansChannelState::PtyExec {
+          _child_abort_handle,
+          pty_writer,
+        }
       }
       _ => bail!("expected Uninitialized or PtyExec channel"),
     };
 
+    // Re-insert channel with its new state if we have not `bail!`'d yet.
+    self.channels.insert(channel_id, channel);
     Ok(())
   }
 }
@@ -528,10 +533,7 @@ impl russh::server::Handler for ServerHandler {
           // TODO: We're currently ignoring the requested modes. We should
           // probably do something with them.
 
-          let pty = pty_process::Pty::new().context("Failed to create PTY")?;
-          // NOTE: we must get `pts` before `.into_split()` because it consumes
-          // the PTY.
-          let pts = pty.pts().context("Failed to get pts")?;
+          let (pty, pts) = pty_process::open()?;
 
           // split pty into reader + writer
           let (pty_reader, pty_writer) = pty.into_split();
@@ -544,15 +546,12 @@ impl russh::server::Handler for ServerHandler {
           // terminal size so we can resize the PTY later in `shell_request`.
           // Most clients seem to send a `pty_request` before a `shell_request`,
           // and it's not clear that sending `pty_request` after `shell_request`
-          // is support by the SSH spec or makes any sense.
-          channel.state = SshenanigansChannelState::PtyExec {
-            _child_abort_handle: None,
-            stuff: PtyStuff {
-              requested_col_width: col_width as u16,
-              requested_row_height: row_height as u16,
-              pts,
-              pty_writer,
-            },
+          // is supported by the SSH spec or makes any sense.
+          channel.state = SshenanigansChannelState::PtyRequested {
+            requested_col_width: col_width as u16,
+            requested_row_height: row_height as u16,
+            pts,
+            pty_writer,
           };
         }
         _ => bail!("expected Uninitialized channel"),
@@ -601,10 +600,7 @@ impl russh::server::Handler for ServerHandler {
     {
       let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
       match channel.state {
-        SshenanigansChannelState::PtyExec {
-          stuff: PtyStuff { ref mut pty_writer, .. },
-          ..
-        } => {
+        SshenanigansChannelState::PtyExec { ref mut pty_writer, .. } => {
           tracing::trace!(?data, "writing to PtyExec");
           pty_writer.write_all(data).await.context("Failed to write to PTY")?;
         }
@@ -665,10 +661,7 @@ impl russh::server::Handler for ServerHandler {
     {
       let mut channel = self.channels.get_mut(&channel_id).context("channel_id not found")?;
       match channel.state {
-        SshenanigansChannelState::PtyExec {
-          stuff: PtyStuff { ref mut pty_writer, .. },
-          ..
-        } => {
+        SshenanigansChannelState::PtyExec { ref mut pty_writer, .. } => {
           pty_writer.resize(pty_process::Size::new(row_height as u16, col_width as u16))?;
         }
         _ => bail!("expected PtyExec channel"),
