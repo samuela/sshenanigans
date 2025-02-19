@@ -323,7 +323,9 @@ impl ServerHandler {
             MethodSet::from(
               methods
                 .iter()
-                .map(|method| MethodKind::from_str(method).expect("Bad method name in `proceed_with_methods`. Allowed values are 'NONE', 'PASSWORD', 'PUBLICKEY', 'HOSTBASED', 'KEYBOARD_INTERACTIVE' (case sensitive).")).collect::<Vec<MethodKind>>().deref(),
+                // TODO: It would be nice to fail with a useful error message
+                // here including the invalid method name.
+                .map(|method| MethodKind::from_str(method).expect("Bad method name in `proceed_with_methods`. Allowed values are 'none', 'password', 'publickey', 'hostbased', 'keyboard-interactive' (case sensitive).")).collect::<Vec<MethodKind>>().deref(),
             )
           }),
         }
