@@ -79,7 +79,7 @@ Responses should either accept the reqeust or respond with a rejection and a set
 { "accept": false, "proceed_with_methods": ["PASSWORD"] }
 ```
 
-Allowed `proceed_with_methods` values are "NONE", "PASSWORD", "PUBLICKEY", "HOSTBASED", "KEYBOARD_INTERACTIVE" (case sensitive).
+Allowed `proceed_with_methods` values are 'none', 'password', 'publickey', 'hostbased', 'keyboard-interactive' (case sensitive).
 
 ### `Shell` requests
 
