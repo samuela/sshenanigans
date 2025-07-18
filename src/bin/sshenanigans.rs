@@ -1,4 +1,4 @@
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::Parser;
 use dashmap::DashMap;
 use futures::future::join_all;
@@ -288,7 +288,9 @@ impl ServerHandler {
     if exit_status.success() {
       serde_json::from_slice(&output.stdout).context("Failed to parse gatekeeper stdout")
     } else {
-      bail!("The Gatekeeper exited with a non-zero status code, {exit_status}. The Gatekeeper should never exit with a non-zero status code, even when rejecting requests.");
+      bail!(
+        "The Gatekeeper exited with a non-zero status code, {exit_status}. The Gatekeeper should never exit with a non-zero status code, even when rejecting requests."
+      );
     }
   }
 
@@ -328,6 +330,7 @@ impl ServerHandler {
                 .map(|method| MethodKind::from_str(method).expect("Bad method name in `proceed_with_methods`. Allowed values are 'none', 'password', 'publickey', 'hostbased', 'keyboard-interactive' (case sensitive).")).collect::<Vec<MethodKind>>().deref(),
             )
           }),
+          partial_success: false,
         }
       }
     })
