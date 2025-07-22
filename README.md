@@ -1,5 +1,7 @@
 # sshenanigans: Build your own SSH server
 
+![Crates.io Version](https://img.shields.io/crates/v/sshenanigans)
+
 sshenanigans is an extensible SSH server. Build your own [SSH game](https://github.com/ajeetdsouza/clidle), [honeypot](https://github.com/telekom-security/tpotce), or SSH server that integrates with your custom user database!
 
 Implement a "Gatekeeper" executable (eg., a [Python script](./examples/basic.py)) that answers questions about who can authenticate and what commands they can execute, and sshenanigans takes care of the rest. sshenanigans works by relaying requests to The Gatekeeper in JSON over stdin. The Gatekeeper then responds with JSON on stdout. That's it... that's all you need!
