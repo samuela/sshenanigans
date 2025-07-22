@@ -1,2 +1,5 @@
 /target
 result*
+ssh_host_*_key
+ssh_host_*_key.pub
+.devcontainer/
