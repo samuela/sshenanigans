@@ -5,8 +5,8 @@ use futures::future::join_all;
 use pty_process::OwnedWritePty;
 use russh::keys::PublicKeyBase64;
 use russh::server::Server as _;
-use russh::server::{Auth, Msg, Session};
-use russh::{Channel, ChannelId, CryptoVec, MethodKind, MethodSet};
+use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
+use russh::{Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet};
 use serde::de::DeserializeOwned;
 use sshenanigans::{
   AuthResponse, Credentials, CredentialsType, ExecResponse, ExecResponseAccept, Request, RequestType,
@@ -212,7 +212,7 @@ where
       // closing the channel before we can finish writing to it?
       //
       // TODO: debug and come up with a better solution
-      if let Err(error) = handle.data(channel_id, CryptoVec::from_slice(&buffer[0..n])).await {
+      if let Err(error) = handle.data(channel_id, buffer[0..n].to_vec()).await {
         tracing::error!(?error, "sending data failed");
         break;
       }
@@ -502,8 +502,13 @@ impl russh::server::Handler for ServerHandler {
   }
 
   // Not a lot of logic here, but russh requires this handler.
-  #[tracing::instrument(parent = &self.tracing_span, skip(self, _session))]
-  async fn channel_open_session(&mut self, channel: Channel<Msg>, _session: &mut Session) -> Result<bool, Self::Error> {
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, reply, _session))]
+  async fn channel_open_session(
+    &mut self,
+    channel: Channel<Msg>,
+    reply: ChannelOpenHandle,
+    _session: &mut Session,
+  ) -> Result<(), Self::Error> {
     // Note: We don't guard against clobbering an existing channel id.
     self.channels.insert(
       channel.id(),
@@ -512,7 +517,8 @@ impl russh::server::Handler for ServerHandler {
         state: SshenanigansChannelState::Uninitialized,
       },
     );
-    Ok(true)
+    reply.accept().await;
+    Ok(())
   }
 
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
@@ -722,7 +728,8 @@ impl russh::server::Handler for ServerHandler {
   /// and then `curl localhost:8080` on the client. Both are necessary since
   /// most clients will not invoke `channel_open_direct_tcpip` until a
   /// connection is made to their local socket.
-  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, reply, session))]
+  #[allow(clippy::too_many_arguments)]
   async fn channel_open_direct_tcpip(
     &mut self,
     channel: Channel<Msg>,
@@ -730,12 +737,13 @@ impl russh::server::Handler for ServerHandler {
     port_to_connect: u32,
     originator_address: &str,
     originator_port: u32,
+    reply: ChannelOpenHandle,
     session: &mut Session,
-  ) -> Result<bool, Self::Error> {
+  ) -> Result<(), Self::Error> {
     // TODO: explore unifying this with `maybe_run_user_command_on_channel`.
     // Differences include:
     //  * stderr is inherited here
-    //  * we are expected to return Ok((_, false, _)) when rejecting the request
+    //  * we reject the request via `reply.reject(..)` rather than by accepting
     //  * we would like to update `channel.state` to be `LocalPortForward`
     //  * this can be called before `channel_open_session` and therefore we
     //    won't have an entry in `self.channels` yet.
@@ -752,11 +760,15 @@ impl russh::server::Handler for ServerHandler {
         originator_address: originator_address.to_owned(),
         originator_port,
       })?;
-      // We are expected to return Ok((_, false, _)) when rejecting the request,
-      // in contrast to most of the other handlers.
+      // We reject via the `reply` handle rather than by returning, in contrast
+      // to most of the other handlers. `AdministrativelyProhibited` matches
+      // what russh sends when the handle is dropped without a decision.
       let accept: ExecResponseAccept = match resp.accept {
         Some(x) => x,
-        None => return Ok(false),
+        None => {
+          reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
+          return Ok(());
+        }
       };
 
       let mut child = tokio::process::Command::new(&accept.command)
@@ -779,6 +791,14 @@ impl russh::server::Handler for ServerHandler {
 
       // Read bytes from the child stdout and send them to the SSH client
       let stdout = child.stdout.take().context("Failed to get stdout for child process")?;
+
+      // Security/protocol critical: accept before spawning the pipe task.
+      // `pipe_to_channel` starts writing channel data immediately, and that data
+      // must not reach the client ahead of the channel-open confirmation.
+      // Accepting this late also means an early `?` above rejects the channel by
+      // dropping `reply`.
+      reply.accept().await;
+
       let handle_ = session.handle().clone();
       pipe_to_channel(channel_id, handle_, stdout).await;
 
@@ -805,7 +825,7 @@ impl russh::server::Handler for ServerHandler {
       );
     }
 
-    Ok(true)
+    Ok(())
   }
 
   #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
