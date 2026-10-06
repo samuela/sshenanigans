@@ -1,7 +1,11 @@
 {
   inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     utils.url = "github:numtide/flake-utils";
     naersk.url = "github:nix-community/naersk";
+    # Build with the same nixpkgs (and thus the same Rust toolchain) as the
+    # dev shell, instead of naersk pulling in a second, separately pinned one.
+    naersk.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs = { self, nixpkgs, utils, naersk }:
