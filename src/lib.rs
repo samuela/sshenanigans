@@ -65,7 +65,7 @@ pub struct Request {
   pub request: RequestType,
 }
 
-/// This is the response to a Request::Shell or Request::Exec request.
+/// This is the response to a `RequestType::Shell` or `RequestType::Exec` request.
 #[derive(Deserialize)]
 pub struct ExecResponse {
   /// If this is Some, then the request will be accepted and the command will be
@@ -81,7 +81,8 @@ pub struct ExecResponseAccept {
   pub arguments: Vec<String>,
   /// The working directory to execute the command in.
   pub working_directory: PathBuf,
-  /// Environment variables to set for the command.
+  /// Environment variables to set for the command. Required; use an empty map
+  /// when no environment variables are needed.
   pub environment_variables: HashMap<String, String>,
   /// The user to execute the command as.
   pub uid: u32,
@@ -93,9 +94,10 @@ pub struct ExecResponseAccept {
 pub struct AuthResponse {
   /// Whether to accept the authentication request.
   pub accept: bool,
-  /// Allowed values are specified in <https://docs.rs/russh/latest/russh/struct.MethodSet.html>.
-  /// Currently they are "NONE", "PASSWORD", "PUBLICKEY", "HOSTBASED",
-  /// "KEYBOARD_INTERACTIVE" (case sensitive). A value is recommended when
-  /// accept is false.
+  /// Authentication methods to offer to the client when `accept` is false.
+  /// Values are case-sensitive; invalid names are errors. Recognized values
+  /// are `"none"`, `"password"`,
+  /// `"publickey"`, `"hostbased"`, and `"keyboard-interactive"`; see
+  /// <https://docs.rs/russh/latest/russh/struct.MethodSet.html>.
   pub proceed_with_methods: Option<Vec<String>>,
 }

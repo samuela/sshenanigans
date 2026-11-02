@@ -193,6 +193,61 @@ async fn close_channel(
   }
 }
 
+/// Parse a gatekeeper's `proceed_with_methods` values into russh method kinds.
+///
+/// Names must match russh's lowercase spelling exactly. Invalid names return an
+/// error rather than panicking or silently accepting a malformed response.
+fn parse_method_kinds(methods: &[String]) -> anyhow::Result<Vec<MethodKind>> {
+  methods
+    .iter()
+    .map(|method| {
+      MethodKind::from_str(method).map_err(|_| {
+        anyhow::anyhow!(
+          "invalid auth method {method:?} in `proceed_with_methods`; expected 'none', 'password', \
+           'publickey', 'hostbased', or 'keyboard-interactive' (case sensitive)"
+        )
+      })
+    })
+    .collect()
+}
+
+#[cfg(test)]
+mod auth_method_tests {
+  use super::*;
+
+  #[test]
+  fn lowercase_method_names_are_accepted() {
+    let methods = parse_method_kinds(&[
+      "none".into(),
+      "password".into(),
+      "publickey".into(),
+      "hostbased".into(),
+      "keyboard-interactive".into(),
+    ])
+    .unwrap();
+    assert!(matches!(
+      methods.as_slice(),
+      [
+        MethodKind::None,
+        MethodKind::Password,
+        MethodKind::PublicKey,
+        MethodKind::HostBased,
+        MethodKind::KeyboardInteractive
+      ]
+    ));
+  }
+
+  #[test]
+  fn invalid_method_names_are_errors() {
+    for method in ["PASSWORD", "Password", "unknown"] {
+      let error = parse_method_kinds(&["password".into(), method.into()]).unwrap_err();
+      let message = error.to_string();
+      assert!(message.contains(method));
+      assert!(message.contains("proceed_with_methods"));
+    }
+  }
+}
+
 async fn pipe_to_channel<R>(
   channel_id: ChannelId,
   handle: russh::server::Handle,
@@ -321,15 +376,9 @@ impl ServerHandler {
         tracing::info!(?proceed_with_methods, "gatekeeper rejected auth request");
         self.verified_credentials = None;
         russh::server::Auth::Reject {
-          proceed_with_methods: proceed_with_methods.map(|methods| {
-            MethodSet::from(
-              methods
-                .iter()
-                // TODO: It would be nice to fail with a useful error message
-                // here including the invalid method name.
-                .map(|method| MethodKind::from_str(method).expect("Bad method name in `proceed_with_methods`. Allowed values are 'none', 'password', 'publickey', 'hostbased', 'keyboard-interactive' (case sensitive).")).collect::<Vec<MethodKind>>().deref(),
-            )
-          }),
+          proceed_with_methods: proceed_with_methods
+            .map(|methods| parse_method_kinds(&methods).map(|methods| MethodSet::from(methods.deref())))
+            .transpose()?,
           partial_success: false,
         }
       }

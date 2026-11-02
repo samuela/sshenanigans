@@ -71,17 +71,17 @@ There are three types of `Auth` requests: `None`, `Password`, and `PublicKey`. F
 }
 ```
 
-Responses should either accept the reqeust or respond with a rejection and a set of suggested authentication methods:
+Responses should either accept the request or respond with a rejection and a set of suggested authentication methods:
 
 ```json
 { "accept": true }
 ```
 
 ```json
-{ "accept": false, "proceed_with_methods": ["PASSWORD"] }
+{ "accept": false, "proceed_with_methods": ["password"] }
 ```
 
-Allowed `proceed_with_methods` values are 'none', 'password', 'publickey', 'hostbased', 'keyboard-interactive' (case sensitive).
+Allowed `proceed_with_methods` values are 'none', 'password', 'publickey', 'hostbased', and 'keyboard-interactive' (case sensitive). Unrecognized values are errors.
 
 ### `Shell` requests
 
@@ -105,9 +105,10 @@ And responses look like
 ```json
 {
   "accept": {
-    "command": "/bin/bash",
+    "command": "/bin/sh",
     "arguments": [],
     "working_directory": "/",
+    "environment_variables": {},
     "uid": 501,
     "gid": 20
   }
@@ -115,6 +116,8 @@ And responses look like
 ```
 
 or simply `{}` for a rejection.
+
+All fields inside `accept` are required, including `environment_variables`. Use an empty map (`{}`) when no environment variables are needed.
 
 ### `Exec` requests
 
@@ -180,6 +183,8 @@ And responses follow the same structure as for `Shell` requests. If sshenanigans
 
 ## Getting started
 
+Install the latest release with `cargo install sshenanigans --locked`, or build from source with `cargo build --release` / `nix build`.
+
 1. First, we'll need to create an SSH key pair for the server: `ssh-keygen -N '' -t ed25519 -f ./hostkey`.
 
    This will create files `hostkey` and `hostkey.pub` in your current directory. This key pair is used to identify the SSH server to clients. If you have ever seen a "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!" message, that's because the SSH server changed their host key.
@@ -190,7 +195,7 @@ And responses follow the same structure as for `Shell` requests. If sshenanigans
 
 3. Connect in a separate terminal: `ssh -p 2222 -t sam@localhost`
 
-   Use password "topsecret" when prompted. You should see a bash shell!
+   Use password "topsecret" when prompted. You should see a shell!
 
 Check out `examples/basic.py` for more information.
 
@@ -203,7 +208,7 @@ sshenanigans is in active development. Please report any issues you find! A few 
 3. Consider running sshenanigans as a minimally privileged user. When executing client commands, sshenanigans will drop privileges to the uid and gid specified by The Gatekeeper. Therefore, you only need to run sshenanigans with the privileges required to bind to a port, read the host key, and spawn processes with the uid/gid values outputted by The Gatekeeper.
 4. sshenanigans is not intended to replace OpenSSH. If OpenSSH suits your needs, use it for its stability and battle-hardened security.
 
-If you are curious about sshenanigans's security, you are encouraged to check out the source. The implementation is <750 lines of Rust code.
+If you are curious about sshenanigans's security, you are encouraged to check out the source. The implementation is roughly 1,100 lines of Rust code.
 
 # Licensing
 

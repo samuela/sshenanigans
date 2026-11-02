@@ -26,10 +26,12 @@ print(message, file=sys.stderr)
 
 respond = lambda x: print(json.dumps(x))
 
-# There are 3 types of requests that can be received by The Gatekeeper:
-#   * Auth  -- Sent when a client attempts to authenticate.
-#   * Shell -- After successful Auth, sent when a client runs eg `ssh user@host`.
-#   * Exec  -- After successful Auth, sent when a client runs eg `ssh user@host ls -al`
+# There are 5 types of requests that can be received by The Gatekeeper:
+#   * Auth             -- Sent when a client attempts to authenticate.
+#   * Shell            -- After successful Auth, sent when a client runs eg `ssh user@host`.
+#   * Exec             -- After successful Auth, sent when a client runs eg `ssh user@host ls -al`
+#   * LocalPortForward -- After successful Auth, sent for eg `ssh -L 8080:localhost:8080 user@host`
+#   * Subsystem        -- After successful Auth, sent for eg `scp file user@host:`.
 #
 # Depending on how The Gatekeeper responds, sshenanigans all accept/reject
 # connections, execute commands, or start shells.
@@ -58,7 +60,7 @@ if "Auth" in request:
   if username == "sam" and password == "topsecret":
     respond({ "accept": True })
   else:
-    respond({ "accept": False, "proceed_with_methods": ["PASSWORD"] })
+    respond({ "accept": False, "proceed_with_methods": ["password"] })
 
 elif "Shell" in request:
   # `ssh user@host`
@@ -75,9 +77,10 @@ elif "Shell" in request:
   # modify this to suit your needs, and probably run as a non-root user.
   respond({
     "accept": {
-      "command": "/bin/bash",
+      "command": "/bin/sh",
       "arguments": [],
       "working_directory": "/",
+      "environment_variables": {},
       "uid": os.getuid(),
       "gid": os.getgid()
     }
@@ -101,6 +104,7 @@ elif "Exec" in request:
         "command": cmd,
         "arguments": args,
         "working_directory": "/",
+        "environment_variables": {},
         "uid": os.getuid(),
         "gid": os.getgid()
       }
