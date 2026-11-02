@@ -26,7 +26,8 @@
         # `nix develop`
         devShell = with pkgs;
           mkShell {
-            nativeBuildInputs = ([ cargo rustc rustfmt ]
+            nativeBuildInputs = ([ cargo rustc rustfmt python3 openssh coreutils gnugrep bash ]
+              ++ lib.optionals stdenv.isLinux [ util-linux ]
               ++ lib.optionals stdenv.isDarwin [ libiconv ]);
           };
       });

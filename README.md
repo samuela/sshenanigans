@@ -199,6 +199,19 @@ Install the latest release with `cargo install sshenanigans --locked`, or build 
 
 Check out `examples/basic.py` for more information.
 
+## Development
+
+CI runs `nix build`, `cargo fmt -- --check`, and an end-to-end smoke test that drives a real `ssh` client against `examples/basic.py`. Run the build, formatting, and regression checks locally with:
+
+```sh
+nix build
+nix develop --command cargo fmt -- --check
+nix develop --command cargo test --locked --all-targets
+nix develop --command ./tests/quickstart.sh
+```
+
+The quickstart smoke test requires Linux (`setsid`); the dev shell supplies its test tools. It checks password authentication, remote command output, and an interactive PTY shell.
+
 # Security considerations
 
 sshenanigans is in active development. Please report any issues you find! A few things to keep in mind:
