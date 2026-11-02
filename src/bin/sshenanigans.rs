@@ -988,7 +988,9 @@ async fn main() -> anyhow::Result<()> {
   let args = Args::parse();
 
   let gatekeeper_split = args.gatekeeper.split_whitespace().collect::<Vec<&str>>();
-  assert!(!gatekeeper_split.is_empty(), "gatekeeper command must not be empty");
+  let Some((gatekeeper_command, gatekeeper_args)) = gatekeeper_split.split_first() else {
+    bail!("gatekeeper command must not be empty");
+  };
 
   let config = russh::server::Config {
     auth_rejection_time: std::time::Duration::from_secs(1),
@@ -1037,15 +1039,12 @@ async fn main() -> anyhow::Result<()> {
   tracing::info!(?addresses, "listening on sockets");
   // We join a task per address to work around https://github.com/warp-tech/russh/issues/223.
   let config_ = Arc::new(config);
-  join_all(sockets.iter().map(|socket| {
-    async {
-      let mut server = Server {
-        // This indexing is safe since we assert that `gatekeeper_split` is not empty above.
-        gatekeeper_command: gatekeeper_split[0].into(),
-        gatekeeper_args: gatekeeper_split[1..].iter().map(|s| s.to_string()).collect(),
-      };
-      server.run_on_socket(config_.clone(), socket).await
-    }
+  join_all(sockets.iter().map(|socket| async {
+    let mut server = Server {
+      gatekeeper_command: (*gatekeeper_command).into(),
+      gatekeeper_args: gatekeeper_args.iter().map(|s| s.to_string()).collect(),
+    };
+    server.run_on_socket(config_.clone(), socket).await
   }))
   .await
   .into_iter()
