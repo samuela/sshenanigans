@@ -171,16 +171,8 @@ async fn close_channel(
   client_id: Uuid,
   handle: &russh::server::Handle,
   channel_id: ChannelId,
-  exit_status: &std::process::ExitStatus,
+  our_exit_status: u32,
 ) {
-  // NOTE: .code() can return None when the child process is killed via a
-  // signal like ctrl-c.
-  let our_exit_status: u32 = match (exit_status.code(), exit_status.signal()) {
-    (Some(code), None) => code.try_into().unwrap_or(1),
-    (None, Some(signal)) => signal as u32 + 128,
-    _ => unreachable!(),
-  };
-
   // Note: these can fail. I have no idea why.
   if let Err(error) = handle.exit_status_request(channel_id, our_exit_status).await {
     tracing::error!(?error, "sending exit status failed");
@@ -190,6 +182,22 @@ async fn close_channel(
   }
   if let Err(error) = handle.close(channel_id).await {
     tracing::error!(?error, "sending close failed");
+  }
+}
+
+/// Map a child process's exit status to the numeric code reported to the SSH
+/// client.
+///
+/// `ExitStatus::code()` returns `None` when the child was killed by a signal
+/// (eg. ctrl-c), in which case we follow the shell convention of
+/// `128 + signal`.
+fn exit_status_to_code(exit_status: &std::process::ExitStatus) -> u32 {
+  match (exit_status.code(), exit_status.signal()) {
+    (Some(code), _) => code.try_into().unwrap_or(1),
+    (None, Some(signal)) => signal as u32 + 128,
+    // Neither a code nor a signal is unexpected, but report failure rather than
+    // panicking inside a detached task.
+    (None, None) => 1,
   }
 }
 
@@ -388,18 +396,36 @@ impl ServerHandler {
   /// Spawn a task to wait on the child process and then close the SSH channel
   /// with the exit code. Move ownership of the child process to the task, and
   /// return an `AbortOnDrop` handle to the task.
-  #[tracing::instrument(level = "debug", skip(self, handle, child), fields(child_pid = child.id().unwrap()))]
+  #[tracing::instrument(level = "debug", skip(self, handle, child, output_tasks), fields(child_pid = ?child.id()))]
   async fn wait_and_close_channel(
     &self,
     channel_id: ChannelId,
     handle: russh::server::Handle,
     mut child: tokio::process::Child,
+    output_tasks: Vec<tokio::task::JoinHandle<()>>,
   ) -> AbortOnDrop {
     let client_address_ = self.client_address;
     let client_id_ = self.client_id;
     AbortOnDrop::new(tokio::spawn(async move {
-      let exit_status = child.wait().await.unwrap();
-      close_channel(client_address_, client_id_, &handle, channel_id, &exit_status).await;
+      let our_exit_status = match child.wait().await {
+        Ok(exit_status) => exit_status_to_code(&exit_status),
+        Err(error) => {
+          tracing::error!(?error, "waiting for child process failed");
+          1
+        }
+      };
+
+      // Drain the child's stdout/stderr before telling the client the channel is
+      // done. The child has exited, so its pipes are closed and these tasks
+      // finish promptly. Closing the channel first would drop output from
+      // commands that exit quickly.
+      for output_task in output_tasks {
+        if let Err(error) = output_task.await {
+          tracing::error!(?error, "output forwarding task failed");
+        }
+      }
+
+      close_channel(client_address_, client_id_, &handle, channel_id, our_exit_status).await;
       drop(child);
     }))
   }
@@ -447,17 +473,19 @@ impl ServerHandler {
 
         // Read bytes from the child stdout and send them to the SSH client
         let stdout = child.stdout.take().context("Failed to get stdout for child process")?;
-        pipe_to_channel(channel_id, handle.clone(), stdout).await;
+        let stdout_task = pipe_to_channel(channel_id, handle.clone(), stdout).await;
 
         // Now, same for stderr...
         let stderr = child.stderr.take().context("Failed to get stderr for child process")?;
-        pipe_to_channel(channel_id, handle.clone(), stderr).await;
+        let stderr_task = pipe_to_channel(channel_id, handle.clone(), stderr).await;
 
         let stdin_writer = child.stdin.take().context("Failed to get stdin for child process")?;
         // Note: we would like to `wait_and_close_channel` as early as possible
         // in case of Err short-circuiting the function, but it consumes
         // ownership of `child`.
-        let _child_abort_handle = self.wait_and_close_channel(channel_id, handle, child).await;
+        let _child_abort_handle = self
+          .wait_and_close_channel(channel_id, handle, child, vec![stdout_task, stderr_task])
+          .await;
 
         SshenanigansChannelState::NonPtyExec {
           _child_abort_handle,
@@ -487,7 +515,7 @@ impl ServerHandler {
         tracing::info!(pid = child.id(), "child spawned");
 
         // Do this before resizing the PTY, in case the resize fails.
-        let _child_abort_handle = self.wait_and_close_channel(channel_id, handle, child).await;
+        let _child_abort_handle = self.wait_and_close_channel(channel_id, handle, child, vec![]).await;
 
         // Notes:
         // 1. We already set up a task to read from the PTY and send to the SSH
@@ -738,23 +766,27 @@ impl russh::server::Handler for ServerHandler {
     Ok(())
   }
 
-  #[tracing::instrument(parent = &self.tracing_span, skip(self, session))]
-  async fn channel_eof(&mut self, channel_id: ChannelId, session: &mut Session) -> Result<(), Self::Error> {
-    // This will be called instead of `channel_close` by eg sftp subsystem
-    // channels.
-
-    let handle = session.handle();
-    close_channel(
-      self.client_address,
-      self.client_id,
-      &handle,
-      channel_id,
-      // We just assume a 0 exit code here to appease the scp gods. If we don't
-      // send an exit status the scp client will exit with status 1.
-      &std::process::ExitStatus::from_raw(0),
-    )
-    .await;
-    drop(self.channels.remove(&channel_id));
+  #[tracing::instrument(parent = &self.tracing_span, skip(self, _session))]
+  async fn channel_eof(&mut self, channel_id: ChannelId, _session: &mut Session) -> Result<(), Self::Error> {
+    // The client has no more data to send, but it may still be waiting for the
+    // command's output. Close the child's stdin and let the child exit on its
+    // own: `wait_and_close_channel` sends the exit status and closes the channel
+    // once the process is done. Closing the channel here would drop the output
+    // of any command that outlives the client's stdin, which includes the common
+    // `ssh user@host ls` case and eg `ssh user@host 'sleep 1; echo hi'`.
+    let Some((_, mut channel)) = self.channels.remove(&channel_id) else {
+      return Ok(());
+    };
+    match &mut channel.state {
+      SshenanigansChannelState::NonPtyExec { stdin_writer, .. }
+      | SshenanigansChannelState::LocalPortForward { stdin_writer, .. } => {
+        if let Err(error) = stdin_writer.shutdown().await {
+          tracing::error!(?error, "closing child stdin failed");
+        }
+      }
+      _ => {}
+    }
+    self.channels.insert(channel_id, channel);
     Ok(())
   }
 
@@ -849,14 +881,16 @@ impl russh::server::Handler for ServerHandler {
       reply.accept().await;
 
       let handle_ = session.handle().clone();
-      pipe_to_channel(channel_id, handle_, stdout).await;
+      let stdout_task = pipe_to_channel(channel_id, handle_, stdout).await;
 
       let stdin = child.stdin.take().context("Failed to get stdin for child process")?;
       // Note: we would like to `wait_and_close_channel` as early as possible in
       // case of Err short-circuiting the function, but it consumes ownership of
       // `child`.
       let handle = session.handle().clone();
-      let wait_handle = self.wait_and_close_channel(channel_id, handle, child).await;
+      let wait_handle = self
+        .wait_and_close_channel(channel_id, handle, child, vec![stdout_task])
+        .await;
 
       self.channels.insert(
         channel_id,
