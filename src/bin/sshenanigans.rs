@@ -488,7 +488,12 @@ impl russh::server::Handler for ServerHandler {
 
   // `public_key` Debug prints in a format that is basically worthless.
   #[tracing::instrument(parent = &self.tracing_span, skip(self, public_key))]
-  async fn auth_publickey(&mut self, username: &str, public_key: &russh::keys::PublicKey) -> Result<Auth, Self::Error> {
+  async fn auth_publickey(
+    &mut self,
+    username: &str,
+    public_key: russh::server::VerifiedPublicKey<'_>,
+  ) -> Result<Auth, Self::Error> {
+    let public_key = public_key.public_key;
     let public_key_algorithm = public_key.algorithm().as_str().to_owned();
     let public_key_base64 = public_key.public_key_base64();
     tracing::info!(public_key_algorithm, public_key_base64);
